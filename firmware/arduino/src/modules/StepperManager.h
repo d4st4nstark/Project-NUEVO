@@ -104,6 +104,13 @@ public:
      */
     static bool anyMoving();
 
+    /**
+     * @brief Check if any stepper driver is enabled
+     *
+     * @return True if at least one stepper channel is enabled
+     */
+    static bool anyEnabled();
+
 private:
     // Stepper motor instances
     static StepperMotor steppers_[NUM_STEPPERS];

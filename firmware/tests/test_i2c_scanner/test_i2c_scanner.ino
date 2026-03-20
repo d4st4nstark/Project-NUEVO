@@ -18,6 +18,102 @@
 
 #include <Wire.h>
 
+namespace {
+
+const uint32_t kScanSpeedsHz[] = {
+    100000UL,
+    50000UL,
+    25000UL,
+};
+
+const char *describeWireError(uint8_t error) {
+    switch (error) {
+        case 0: return "ACK";
+        case 1: return "buffer overflow";
+        case 2: return "NACK on address";
+        case 3: return "NACK on data";
+        case 4: return "other TWI error";
+        case 5: return "timeout";
+        default: return "unknown";
+    }
+}
+
+void printKnownDeviceName(uint8_t address) {
+    switch (address) {
+        case 0x40:
+            Serial.print(F("(PCA9685 PWM Controller)"));
+            break;
+        case 0x68:
+            Serial.print(F("(ICM-20948 IMU or MPU-6050)"));
+            break;
+        case 0x69:
+            Serial.print(F("(ICM-20948 IMU alternate)"));
+            break;
+        case 0x70:
+            Serial.print(F("(PCA9685 ALL_CALL broadcast)"));
+            break;
+        default:
+            Serial.print(F("(Unknown device)"));
+            break;
+    }
+}
+
+void scanBusAtSpeed(uint32_t speedHz) {
+    Wire.setClock(speedHz);
+    Wire.setWireTimeout(5000, true);
+
+    Serial.println(F("----------------------------------------"));
+    Serial.print(F("Scanning at "));
+    Serial.print(speedHz / 1000UL);
+    Serial.println(F(" kHz"));
+    Serial.println(F("----------------------------------------"));
+
+    uint8_t deviceCount = 0;
+    uint8_t errorCount = 0;
+
+    for (uint8_t address = 1; address < 127; address++) {
+        Wire.beginTransmission(address);
+        uint8_t error = Wire.endTransmission();
+
+        if (error == 0) {
+            Serial.print(F("Device found at 0x"));
+            if (address < 16) Serial.print(F("0"));
+            Serial.print(address, HEX);
+            Serial.print(F("  "));
+            printKnownDeviceName(address);
+            Serial.println();
+            deviceCount++;
+        } else if (error != 2) {
+            Serial.print(F("Error "));
+            Serial.print(error);
+            Serial.print(F(" ("));
+            Serial.print(describeWireError(error));
+            Serial.print(F(") at 0x"));
+            if (address < 16) Serial.print(F("0"));
+            Serial.println(address, HEX);
+            errorCount++;
+        }
+    }
+
+    Serial.println();
+    Serial.print(F("Summary @ "));
+    Serial.print(speedHz / 1000UL);
+    Serial.print(F(" kHz: devices="));
+    Serial.print(deviceCount);
+    Serial.print(F(", errors="));
+    Serial.println(errorCount);
+    Serial.println();
+}
+
+void runScan() {
+    for (uint8_t i = 0; i < (sizeof(kScanSpeedsHz) / sizeof(kScanSpeedsHz[0])); i++) {
+        scanBusAtSpeed(kScanSpeedsHz[i]);
+        delay(50);
+    }
+}
+
+} // namespace
+
 void setup() {
     Serial.begin(115200);
     while (!Serial && millis() < 2000) {
@@ -31,61 +127,15 @@ void setup() {
     Serial.println();
 
     Wire.begin();
+    Wire.setWireTimeout(5000, true);
 
-    Serial.println(F("Scanning I2C bus (0x01-0x7F)..."));
+    Serial.println(F("Scanning I2C bus (0x01-0x7F) at multiple speeds..."));
+    Serial.println(F("Notes:"));
+    Serial.println(F("  - Error 2 = no ACK on address (normal if no device at that slot)"));
+    Serial.println(F("  - Error 4/5 = bus-level problem worth investigating"));
     Serial.println();
 
-    uint8_t deviceCount = 0;
-
-    for (uint8_t address = 1; address < 127; address++) {
-        Wire.beginTransmission(address);
-        uint8_t error = Wire.endTransmission();
-
-        if (error == 0) {
-            Serial.print(F("Device found at 0x"));
-            if (address < 16) Serial.print(F("0"));
-            Serial.print(address, HEX);
-            Serial.print(F("  "));
-
-            // Identify common devices
-            switch (address) {
-                case 0x40:
-                    Serial.println(F("(PCA9685 PWM Controller)"));
-                    break;
-                case 0x68:
-                    Serial.println(F("(ICM-20948 IMU or MPU-6050)"));
-                    break;
-                case 0x69:
-                    Serial.println(F("(ICM-20948 IMU alternate)"));
-                    break;
-                case 0x70:
-                    Serial.println(F("(PCA9685 ALL_CALL broadcast)"));
-                    break;
-                default:
-                    Serial.println(F("(Unknown device)"));
-                    break;
-            }
-
-            deviceCount++;
-        } else if (error == 4) {
-            Serial.print(F("Unknown error at address 0x"));
-            if (address < 16) Serial.print(F("0"));
-            Serial.println(address, HEX);
-        }
-    }
-
-    Serial.println();
-    if (deviceCount == 0) {
-        Serial.println(F("No I2C devices found!"));
-        Serial.println(F("Check:"));
-        Serial.println(F("  - SDA/SCL connections (pins 20/21)"));
-        Serial.println(F("  - Pull-up resistors (4.7kΩ)"));
-        Serial.println(F("  - Device power supply"));
-    } else {
-        Serial.print(F("Found "));
-        Serial.print(deviceCount);
-        Serial.println(F(" device(s)"));
-    }
+    runScan();
 
     Serial.println();
     Serial.println(F("Scan complete. Type any key to rescan."));
@@ -97,6 +147,8 @@ void loop() {
         Serial.read();  // Clear buffer
         Serial.println(F("\nRescanning..."));
         delay(100);
-        setup();  // Re-run scan
+        runScan();
+        Serial.println(F("\nScan complete. Type any key to rescan."));
+        Serial.println(F("========================================"));
     }
 }

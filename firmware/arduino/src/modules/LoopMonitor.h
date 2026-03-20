@@ -57,7 +57,7 @@ enum LoopSlot : uint8_t {
     SLOT_PID_ISR     = 0,   ///< TIMER1 @ 800 Hz;  budget 80 µs (single motor slice)
     SLOT_STEPPER_ISR = 1,   ///< TIMER3 @ 10 kHz;  budget   60 µs
     SLOT_MOTOR_TASK  = 2,   ///< soft motor task  @ 100 Hz; budget 5000 µs
-    SLOT_SENSOR_ISR  = 3,   ///< soft sensor task @ 100 Hz; budget 8000 µs
+    SLOT_SENSOR_ISR  = 3,   ///< legacy name; actually soft sensor task @ 100 Hz; budget 8000 µs
     SLOT_UART_TASK   = 4,   ///< soft UART task   @  50 Hz; budget 20000 µs
     SLOT_USERIO      = 5,   ///< soft   @  20 Hz;  budget 40000 µs
     LOOP_SLOT_COUNT  = 6
@@ -109,17 +109,27 @@ public:
     // ---- Fault reporting ------------------------------------------------
 
     /**
-     * @brief Returns the OR of all slot fault bits that have fired since
-     * the last clearFaults() call.  Bit N corresponds to LoopSlot N.
-     * uint8_t is atomic on AVR — safe to read from non-ISR context.
+     * @brief Returns the cumulative OR of all slot fault bits that have fired
+     * since the last clearFaults() call.
+     *
+     * This is useful for long-run diagnostics, but it is not the same as the
+     * "live" current-window overrun state shown in the status reporter.
      */
-    static uint8_t getFaultMask() { return faultMask_; }
+    static uint8_t getLatchedFaultMask() { return faultMask_; }
 
     /**
-     * @brief Clear the cumulative fault-mask (call on CMD_RESET).
+     * @brief Returns the OR of all slot fault bits that fired since the last
+     * clearPeaks() call.
+     *
+     * This is the current-window/live overrun view used by the status reporter.
+     */
+    static uint8_t getLiveFaultMask() { return liveFaultMask_; }
+
+    /**
+     * @brief Clear cumulative loop-fault state (call on CMD_RESET).
      * Does NOT reset faultCount per slot.
      */
-    static void clearFaults() { faultMask_ = 0; }
+    static void clearFaults() { faultMask_ = 0; liveFaultMask_ = 0; }
 
     // ---- Per-slot accessors (non-ISR context only) ----------------------
 
@@ -181,7 +191,8 @@ private:
 
     static SlotData         slots_[LOOP_SLOT_COUNT];
     static RoundData        pidRound_;
-    static volatile uint8_t faultMask_; ///< OR of fault bits; atomic on AVR
+    static volatile uint8_t faultMask_;     ///< cumulative OR of all overrun bits
+    static volatile uint8_t liveFaultMask_; ///< rolling OR since last clearPeaks()
 };
 
 #endif // LOOP_MONITOR_H

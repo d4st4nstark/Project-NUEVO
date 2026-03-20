@@ -6,8 +6,8 @@
  * dispatches work at three rates using an internal 0–9 counter:
  *
  *   update100Hz()  — every tick       → 100 Hz: IMU read + Fusion AHRS
- *   update50Hz()   — even ticks       →  50 Hz: Lidar sensors
- *   update10Hz()   — tick 0 only      →  10 Hz: Voltages + Ultrasonic
+ *   update50Hz()   — even ticks       →  50 Hz: Ultrasonic sensors
+ *   update10Hz()   — tick 0 only      →  10 Hz: Voltages
  *
  * Call SensorManager::tick() from the soft scheduler. A compatibility wrapper
  * named isrTick() remains so older code continues to compile, but the bring-up
@@ -18,7 +18,7 @@
  *  2. Add a member pointer/instance in the private section.
  *  3. Place the read call in update100Hz(), update50Hz(), or update10Hz()
  *     according to the sensor's required update rate.
- *  4. Expose the result via a getter (see getLidarDistanceMm() as a model).
+ *  4. Expose the result via a getter (see getUltrasonicDistanceMm() as a model).
  * ─────────────────────────────────────────────────────────────────────────
  *
  * Magnetometer Calibration State Machine
@@ -43,13 +43,11 @@
 #include <stdint.h>
 #include "../config.h"
 #include "../drivers/IMUDriver.h"
-#include "../drivers/LidarDriver.h"
 #include "../drivers/UltrasonicDriver.h"
 #include "../lib/Fusion/FusionWrapper.h"
 #include "PersistentStorage.h"
 
 // Maximum number of range sensors of each type (must match config.h defines)
-#define SENSOR_MAX_LIDARS       4
 #define SENSOR_MAX_ULTRASONICS  4
 
 // ============================================================================
@@ -83,7 +81,7 @@ public:
     /**
      * @brief Initialize all enabled sensors
      *
-     * Initializes I2C, IMU, lidar(s), ultrasonic(s), and reads initial voltages.
+     * Initializes I2C, IMU, ultrasonic sensor(s), and reads initial voltages.
      * Loads magnetometer calibration from EEPROM if available.
      * Call once in setup() before using any sensors.
      */
@@ -94,8 +92,8 @@ public:
      *
      * Dispatches sensor reads at three rates using an internal 0–9 counter:
      *   - update100Hz()  every call       (100 Hz) — IMU + Fusion
-     *   - update50Hz()   every 2nd call   ( 50 Hz) — Lidar
-     *   - update10Hz()   every 10th call  ( 10 Hz) — Voltages + Ultrasonic
+     *   - update50Hz()   every 2nd call   ( 50 Hz) — Ultrasonic
+     *   - update10Hz()   every 10th call  ( 10 Hz) — Voltages
      *
      * Call from the soft scheduler, not from an ISR.
      */
@@ -150,15 +148,11 @@ public:
     static int16_t getRawMagX();
     static int16_t getRawMagY();
     static int16_t getRawMagZ();
+    static int16_t getRawTempDeciC();
 
     // ========================================================================
     // RANGE SENSORS
     // ========================================================================
-
-    /**
-     * @brief Get number of lidar sensors that responded during init
-     */
-    static uint8_t getLidarCount() { return lidarCount_; }
 
     /**
      * @brief Get number of ultrasonic sensors that responded during init
@@ -168,27 +162,18 @@ public:
     /**
      * @brief True if the sensor at this slot responded during init.
      *
-     * A sensor may be configured (LIDAR_COUNT > 0) but absent on the I2C bus.
+     * A sensor may be configured but absent on the I2C bus.
      * Use this to distinguish "configured but missing" from "not configured".
      */
-    static bool isLidarFound(uint8_t idx);
     static bool isUltrasonicFound(uint8_t idx);
 
     /**
      * @brief Number of sensor slots enabled at compile time (from config.h).
      *
-     * Compare with getLidarCount() / getUltrasonicCount() to detect missing sensors:
-     *   missing = getLidarConfiguredCount() - getLidarCount()
+     * Compare with getUltrasonicCount() to detect missing sensors:
+     *   missing = getUltrasonicConfiguredCount() - getUltrasonicCount()
      */
-    static uint8_t getLidarConfiguredCount();
     static uint8_t getUltrasonicConfiguredCount();
-
-    /**
-     * @brief Get latest lidar distance reading
-     *
-     * @param idx Slot index (0-based). Returns 0 if slot not found or out of range.
-     */
-    static uint16_t getLidarDistanceMm(uint8_t idx);
 
     /**
      * @brief Get latest ultrasonic distance reading
@@ -196,6 +181,20 @@ public:
      * @param idx Slot index (0-based). Returns 0 if slot not found or out of range.
      */
     static uint16_t getUltrasonicDistanceMm(uint8_t idx);
+
+    /**
+     * @brief Range-sensor timing stats for debug/status reporting.
+     *
+     * These timings measure only the ultrasonic read loop, not the full
+     * 100 Hz sensor task wrapper.
+     */
+    static uint16_t getUltrasonicTimingAvgUs() { return ultrasonicTimingAvgUs_; }
+    static uint16_t getUltrasonicTimingPeakUs() { return ultrasonicTimingPeakUs_; }
+    static uint16_t getUltrasonicTimingMaxUs() { return ultrasonicTimingMaxUs_; }
+    static uint16_t getImuTimingAvgUs() { return imuTimingAvgUs_; }
+    static uint16_t getImuTimingPeakUs() { return imuTimingPeakUs_; }
+    static uint16_t getImuTimingMaxUs() { return imuTimingMaxUs_; }
+    static void clearTimingPeaks();
 
     // ========================================================================
     // VOLTAGE MONITORING
@@ -219,7 +218,7 @@ public:
     /**
      * @brief Battery under-voltage checks
      *
-     * isBatteryLow()      — below VBAT_WARN_V    → warning (LED blink, NeoPixel yellow)
+     * isBatteryLow()      — below VBAT_WARN_V    → warning / UI status only
      * isBatteryCritical() — below VBAT_CUTOFF_V  → hard safety (motors disabled)
      */
     static bool  isBatteryLow(float threshold = VBAT_LOW_THRESHOLD);
@@ -290,16 +289,18 @@ private:
     static FusionWrapper fusion_;
     static bool imuInitialized_;
     static uint32_t lastImuMicros_;     // micros() at last IMU update (for dt)
+    static uint16_t imuTimingAvgUs_;
+    static uint16_t imuTimingPeakUs_;
+    static uint16_t imuTimingMaxUs_;
 
     // ---- Range sensors ----
-    static LidarDriver      lidars_[SENSOR_MAX_LIDARS];
     static UltrasonicDriver ultrasonics_[SENSOR_MAX_ULTRASONICS];
-    static uint8_t          lidarCount_;        // # that responded during init
     static uint8_t          ultrasonicCount_;   // # that responded during init
-    static bool             lidarFound_[SENSOR_MAX_LIDARS];       // per-slot init result
     static bool             ultrasonicFound_[SENSOR_MAX_ULTRASONICS]; // per-slot init result
-    static uint16_t         lidarDistMm_[SENSOR_MAX_LIDARS];
     static uint16_t         ultrasonicDistMm_[SENSOR_MAX_ULTRASONICS];
+    static uint16_t         ultrasonicTimingAvgUs_;
+    static uint16_t         ultrasonicTimingPeakUs_;
+    static uint16_t         ultrasonicTimingMaxUs_;
 
     // ---- Voltages ----
     static float batteryVoltage_;
@@ -316,8 +317,8 @@ private:
 
     // ---- ISR dispatch sub-tasks ----
     static void update100Hz();   // IMU + Fusion AHRS          (100 Hz — every tick)
-    static void update50Hz();    // Lidar reads                ( 50 Hz — even ticks)
-    static void update10Hz();    // Voltages + Ultrasonic      ( 10 Hz — tick 0 only)
+    static void update50Hz();    // Ultrasonic reads           ( 50 Hz — even ticks)
+    static void update10Hz();    // Voltages only              ( 10 Hz — tick 0 only)
 
     // ---- Internal helpers ----
     static void initMagCalFromStorage();

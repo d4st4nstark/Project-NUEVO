@@ -13,14 +13,13 @@
  *   Module → Generate TLV → MessageCenter → UART → RPi
  *
  * Batched telemetry:
- *   sendTelemetry() opens a single frame, conditionally appends each TLV
- *   based on millis-gated intervals, then queues the completed frame for
- *   non-blocking UART drain from loop(). This cuts per-frame overhead
- *   (header + CRC) from N copies down to one.
+ *   sendTelemetry() opens a single frame, conditionally appends telemetry TLVs
+ *   according to the TELEMETRY_*_MS settings in config.h, then queues the
+ *   completed frame for non-blocking UART drain from loop().
  *
  * Safety:
  * - Liveness timeout: heartbeatValid_ goes false; SafetyManager responds on next 100 Hz check
- * - State machine now owned by SystemManager; MessageCenter routes transitions via requestTransition()
+ * - State machine policy lives in SystemManager; MessageCenter only forwards command triggers
  *
  * Usage:
  *   MessageCenter::init();
@@ -56,6 +55,9 @@
 // UART for an entire 20 ms task period. Large multi-TLV bursts were driving the
 // queued TX length near 500 bytes and correlating with heartbeat loss.
 #define TX_BUFFER_SIZE 256
+// Prefer smaller telemetry frames so lower-priority updates defer to later
+// UART task ticks instead of bunching into one larger burst.
+#define TX_FRAME_SOFT_LIMIT 192
 
 // ============================================================================
 // MESSAGE CENTER CLASS (Static)
@@ -77,7 +79,6 @@ public:
      * @brief Initialize message center
      *
      * Opens Serial2 at RPI_BAUD_RATE and initialises the TLV codec.
-     * Sets firmware state to SYS_STATE_IDLE.
      * Must be called once in setup().
      */
     static void init();
@@ -127,21 +128,11 @@ public:
      * based on its millis interval, then queues the finished frame for
      * non-blocking UART drain from loop().
      *
-     * Rates:
-     * - DC_STATUS_ALL      ( 25 Hz, RUNNING)
-     * - STEP_STATUS_ALL    (  5 Hz, RUNNING)
-     * - SERVO_STATUS_ALL   (  5 Hz, RUNNING)
-     * - SENSOR_IMU         ( 25 Hz, RUNNING, if IMU attached)
-     * - SENSOR_KINEMATICS  ( 25 Hz, RUNNING)
-     * - IO_STATUS          ( 25 Hz, RUNNING)
-     * - SENSOR_RANGE lidar ( 10 Hz, RUNNING, per configured lidar slot)
-     * - SENSOR_RANGE sonic (  5 Hz, RUNNING, per configured ultrasonic slot)
-     *   (status=3 / not-installed is reported for slots that did not respond on init)
-     * - SENSOR_VOLTAGE     (  5 Hz, RUNNING or ERROR)
-     * - SYS_STATUS         (  1 Hz IDLE/ESTOP, 10 Hz RUNNING/ERROR)
-     * - SENSOR_MAG_CAL_STATUS ( 5 Hz while sampling; immediately on cmd response)
+     * The exact cadence of each telemetry group is driven by the
+     * TELEMETRY_*_MS configuration values. Immediate command acknowledgements
+     * and status refreshes can still bypass the periodic cadence.
      *
-     * Should be called from scheduler at 50Hz.
+     * Should be called from the 50 Hz UART task.
      */
     static void sendTelemetry();
 
@@ -174,6 +165,14 @@ public:
     static void disableAllActuators();
 
     /**
+     * @brief Cancel deferred slow side effects queued from received commands.
+     *
+     * Used by SystemManager when STOP / RESET / ESTOP transitions abandon
+     * queued magnetometer calibration or other delayed side effects.
+     */
+    static void cancelDeferredActions();
+
+    /**
      * @brief Latch the error flags that caused the current ERROR state.
      *
      * Called by SafetyManager BEFORE forceState(ERROR) so the cause is not lost
@@ -184,6 +183,11 @@ public:
      * @param flags  SystemErrorFlags bitmask describing the triggering fault(s)
      */
     static void latchFaultFlags(uint8_t flags);
+
+    /**
+     * @brief Clear the latched fault flags after a successful reset.
+     */
+    static void clearFaultLatch();
 
     /**
      * @brief Record UART task wall-clock time for diagnostic display
@@ -282,7 +286,6 @@ private:
     static uint32_t lastIOStatusSendMs_;
     static uint32_t lastStatusSendMs_;
     static uint32_t lastMagCalSendMs_;
-    static uint32_t lastLidarSendMs_;
     static uint32_t lastUltrasonicSendMs_;
 
     // ---- Queued async response ----
@@ -327,6 +330,7 @@ private:
      */
     static void beginFrame();
     static bool appendTlv(uint32_t tlvType, uint16_t tlvLen, const void *dataAddr);
+    static bool appendTelemetryTlv(uint32_t tlvType, uint16_t tlvLen, const void *dataAddr);
 
     /**
      * @brief Finalise and transmit the accumulated frame over RPI_SERIAL
@@ -435,17 +439,14 @@ private:
     static void sendMagCalStatus();
 
     /**
-     * @brief Append SENSOR_RANGE packets for all configured range sensors.
+     * @brief Append SENSOR_RANGE packets for all configured ultrasonic sensors.
      *
      * For sensors that responded during init: sends the latest distance reading
      * (status = 0, valid).
      * For sensors configured in config.h but absent on the I2C bus:
      * sends status = 3 (not installed) so the RPi can notify the user.
-     *
-     * @param lidarOnly  true = only lidar sensors (10 Hz path);
-     *                   false = only ultrasonic sensors (5 Hz path)
      */
-    static void sendSensorRange(bool lidarOnly);
+    static void sendUltrasonicRange();
 
     // ========================================================================
     // HELPERS

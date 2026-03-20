@@ -36,11 +36,9 @@ uint16_t ServoController::channelPulseUs_[16] = {0};
 void ServoController::init() {
     if (initialized_) return;
 
-    // Initialize I2C (Wire)
-    Wire.begin();
-
-    // Reset all PCA9685 devices on the bus
-    pca9685_.resetDevices();
+    // Do not broadcast a general-call software reset here.
+    // The PCA9685 helper sends that reset to I2C address 0x00 for the entire
+    // bus, which is unsafe when ultrasonic / IMU devices share Wire.
 
     // Initialize PCA9685
     // - TotemPole output driver mode (works with most servo setups)

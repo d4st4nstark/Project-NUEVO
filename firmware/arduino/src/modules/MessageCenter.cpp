@@ -98,7 +98,6 @@ uint32_t MessageCenter::lastVoltageSendMs_ = 0;
 uint32_t MessageCenter::lastIOStatusSendMs_ = 0;
 uint32_t MessageCenter::lastStatusSendMs_ = 0;
 uint32_t MessageCenter::lastMagCalSendMs_ = 0;
-uint32_t MessageCenter::lastLidarSendMs_ = 0;
 uint32_t MessageCenter::lastUltrasonicSendMs_ = 0;
 
 bool MessageCenter::pendingMagCal_ = false;
@@ -162,7 +161,6 @@ void MessageCenter::init()
     lastVoltageSendMs_     = now;
     lastStatusSendMs_      = now;
     lastMagCalSendMs_      = now;
-    lastLidarSendMs_       = now - 80;  // first 10 Hz lidar frame at now+20 ms
     lastUltrasonicSendMs_  = now - 180; // first 5 Hz ultrasonic frame at now+20 ms
 
     lastHeartbeatMs_ = now;
@@ -192,8 +190,6 @@ void MessageCenter::init()
     deferredMagCalOffsetY_ = 0.0f;
     deferredMagCalOffsetZ_ = 0.0f;
     RobotKinematics::reset(0, 0);
-    SystemManager::requestTransition(SYS_STATE_IDLE);
-
     initialized_ = true;
 
 #ifdef DEBUG_TLV_PACKETS
@@ -214,6 +210,25 @@ bool MessageCenter::appendTlv(uint32_t tlvType, uint16_t tlvLen, const void *dat
 {
     const size_t required = sizeof(struct TlvHeader) + tlvLen + (MSG_BUFFER_SEGMENT_LEN - 1U);
     if (encodeDesc_.bufferIndex + required > encodeDesc_.bufferSize) {
+        return false;
+    }
+
+    addTlvPacket(&encodeDesc_, tlvType, tlvLen, dataAddr);
+    return true;
+}
+
+bool MessageCenter::appendTelemetryTlv(uint32_t tlvType, uint16_t tlvLen, const void *dataAddr)
+{
+    const size_t required = sizeof(struct TlvHeader) + tlvLen + (MSG_BUFFER_SEGMENT_LEN - 1U);
+    if (encodeDesc_.bufferIndex + required > encodeDesc_.bufferSize) {
+        return false;
+    }
+
+    // Allow one large TLV through if it is the only thing in the frame, but
+    // avoid piling additional telemetry onto a frame that is already near the
+    // UART drain limit for the 50 Hz comms task.
+    if (encodeDesc_.frameHeader.numTlvs > 0 &&
+        encodeDesc_.bufferIndex + required > TX_FRAME_SOFT_LIMIT) {
         return false;
     }
 
@@ -479,6 +494,10 @@ void MessageCenter::snapshotTrafficWindow(uint16_t &rxBytes,
 
 void MessageCenter::sendTelemetry()
 {
+    // Do not rebuild the shared TX buffer while the previous frame is still
+    // draining. sendFrame() also guards this, but by that point beginFrame()
+    // and the appendTelemetryTlv() calls would already have overwritten
+    // txStorage_, corrupting the in-flight frame on the wire.
     if (txPendingOffset_ < txPendingLen_) {
         txDroppedFrames_++;
         return;
@@ -491,6 +510,20 @@ void MessageCenter::sendTelemetry()
     bool running = (state == SYS_STATE_RUNNING);
     bool runningOrError = (state == SYS_STATE_RUNNING ||
                            state == SYS_STATE_ERROR);
+    bool anyDcEnabled = false;
+    for (uint8_t i = 0; i < NUM_DC_MOTORS; i++) {
+        if (dcMotors[i].isEnabled()) {
+            anyDcEnabled = true;
+            break;
+        }
+    }
+    const bool anyStepperActive = StepperManager::anyEnabled() || StepperManager::anyMoving();
+    const bool servoEnabled = ServoController::isEnabled();
+    const uint32_t dcStatusInterval = anyDcEnabled ? TELEMETRY_DC_STATUS_MS : 1000UL;
+    const uint32_t stepStatusInterval = anyStepperActive ? TELEMETRY_STEP_STATUS_MS
+                                                         : (uint32_t)TELEMETRY_STEP_STATUS_MS * 4UL;
+    const uint32_t servoStatusInterval = servoEnabled ? TELEMETRY_SERVO_STATUS_MS
+                                                      : (uint32_t)TELEMETRY_SERVO_STATUS_MS * 4UL;
 
     // Open a new frame; all send*() calls below append TLVs to it.
     beginFrame();
@@ -517,20 +550,23 @@ void MessageCenter::sendTelemetry()
     if (running)
     {
         if (pendingDCStatus_ ||
-            (currentMs - lastDCStatusSendMs_ >= TELEMETRY_DC_STATUS_MS && phase == 0U))
+            (currentMs - lastDCStatusSendMs_ >= dcStatusInterval && phase == 0U))
         {
             lastDCStatusSendMs_ = currentMs;
             pendingDCStatus_ = false;
             sendDCStatusAll();
         }
 
-        if (currentMs - lastStepStatusSendMs_ >= TELEMETRY_STEP_STATUS_MS && phase == 8U)
+        if (currentMs - lastStepStatusSendMs_ >= stepStatusInterval &&
+            phase == 8U)
         {
             lastStepStatusSendMs_ = currentMs;
             sendStepStatusAll();
         }
 
-        if (currentMs - lastKinematicsSendMs_ >= TELEMETRY_KINEMATICS_MS && phase == 2U)
+        if (anyDcEnabled &&
+            currentMs - lastKinematicsSendMs_ >= TELEMETRY_KINEMATICS_MS &&
+            phase == 2U)
         {
             lastKinematicsSendMs_ = currentMs;
             sendSensorKinematics();
@@ -550,15 +586,6 @@ void MessageCenter::sendTelemetry()
             sendSensorIMU();
         }
 
-        // Lidar range at 10 Hz (each configured slot, found or not)
-        if (SensorManager::getLidarConfiguredCount() > 0 &&
-            currentMs - lastLidarSendMs_ >= TELEMETRY_LIDAR_MS &&
-            phase == 1U)
-        {
-            lastLidarSendMs_ = currentMs;
-            sendSensorRange(true);
-        }
-
     }
 
     // Servo status is needed in IDLE as well because the UI can enable and
@@ -566,7 +593,7 @@ void MessageCenter::sendTelemetry()
     // after servo commands so optimistic UI state is confirmed quickly.
     if (state != SYS_STATE_INIT &&
         (pendingServoStatus_ ||
-         (currentMs - lastServoStatusSendMs_ >= TELEMETRY_SERVO_STATUS_MS &&
+         (currentMs - lastServoStatusSendMs_ >= servoStatusInterval &&
           phase == 5U)))
     {
         lastServoStatusSendMs_ = currentMs;
@@ -574,13 +601,15 @@ void MessageCenter::sendTelemetry()
         sendServoStatusAll();
     }
 
-    // Ultrasonic range at 5 Hz (each configured slot, found or not)
-    if (running && SensorManager::getUltrasonicConfiguredCount() > 0 &&
-        currentMs - lastUltrasonicSendMs_ >= TELEMETRY_ULTRASONIC_MS &&
-        phase == 3U)
+    // Ultrasonic range is intended as a responsive live sensor feed, so do not
+    // phase-gate it down to one 200 ms slot. Publish at the configured
+    // interval whenever the UART task runs.
+    if (state != SYS_STATE_INIT &&
+        SensorManager::getUltrasonicConfiguredCount() > 0 &&
+        currentMs - lastUltrasonicSendMs_ >= TELEMETRY_ULTRASONIC_MS)
     {
         lastUltrasonicSendMs_ = currentMs;
-        sendSensorRange(false);
+        sendUltrasonicRange();
     }
 
     // ---- Mag cal status at 5 Hz while sampling ----
@@ -860,7 +889,7 @@ void MessageCenter::handleSysCmd(const PayloadSysCmd *payload)
     switch ((SysCmdType)payload->command)
     {
     case SYS_CMD_START:
-        if (SystemManager::requestTransition(SYS_STATE_RUNNING))
+        if (SystemManager::triggerStartCommand())
         {
             DebugLog::writeFlashLine(F("[SYS] CMD_START -> RUNNING OK"));
         }
@@ -872,23 +901,20 @@ void MessageCenter::handleSysCmd(const PayloadSysCmd *payload)
         break;
 
     case SYS_CMD_STOP:
-        if (SystemManager::requestTransition(SYS_STATE_IDLE))
+        if (SystemManager::triggerStopCommand())
         {
-            disableAllActuators();
-            deferredMagCalAction_ = DEFER_MAG_NONE;
-            pendingMagCal_ = false;
             DebugLog::writeFlashLine(F("[SYS] CMD_STOP -> IDLE"));
+        }
+        else
+        {
+            DebugLog::printf_P(PSTR("[SYS] CMD_STOP rejected state=%u\n"),
+                               (unsigned)SystemManager::getState());
         }
         break;
 
     case SYS_CMD_RESET:
-        if (SystemManager::requestTransition(SYS_STATE_IDLE))
+        if (SystemManager::triggerResetCommand())
         {
-            disableAllActuators();
-            deferredMagCalAction_ = DEFER_MAG_NONE;
-            pendingMagCal_ = false;
-            faultLatchFlags_ = 0;   // clear after successful reset so UI shows clean state
-            LoopMonitor::clearFaults();
             DebugLog::writeFlashLine(F("[SYS] CMD_RESET -> IDLE"));
         }
         else
@@ -899,11 +925,12 @@ void MessageCenter::handleSysCmd(const PayloadSysCmd *payload)
         break;
 
     case SYS_CMD_ESTOP:
-        disableAllActuators();
-        deferredMagCalAction_ = DEFER_MAG_NONE;
-        pendingMagCal_ = false;
-        SystemManager::requestTransition(SYS_STATE_ESTOP);
-        DebugLog::writeFlashLine(F("[SYS] CMD_ESTOP -> ESTOP"));
+        if (SystemManager::triggerEstopCommand()) {
+            DebugLog::writeFlashLine(F("[SYS] CMD_ESTOP -> ESTOP"));
+        } else {
+            DebugLog::printf_P(PSTR("[SYS] CMD_ESTOP rejected state=%u\n"),
+                               (unsigned)SystemManager::getState());
+        }
         break;
 
     default:
@@ -972,15 +999,8 @@ void MessageCenter::handleDCEnable(const PayloadDCEnable *payload)
     }
     else
     {
-        // Enable only permitted in IDLE or RUNNING — block in ERROR / ESTOP / INIT
-        SystemState s = SystemManager::getState();
-        if (s != SYS_STATE_IDLE && s != SYS_STATE_RUNNING) {
-            DEBUG_LOG.println(F("[DC] Enable rejected: invalid state."));
-            return;
-        }
-        // Silently block when no battery present — see VBAT_MIN_PRESENT_V in config.h
-        if (!SensorManager::isBatteryPresent()) {
-            DEBUG_LOG.println(F("[DC] Enable rejected: battery not present."));
+        if (!SystemManager::canEnableDriveActuator()) {
+            DEBUG_LOG.println(F("[DC] Enable rejected: battery absent or invalid state."));
             return;
         }
         motor.enable((DCMotorMode)payload->mode);
@@ -992,7 +1012,7 @@ void MessageCenter::handleDCSetPosition(const PayloadDCSetPosition *payload)
 {
     if (payload->motorId >= NUM_DC_MOTORS)
         return;
-    if (!SensorManager::isBatteryPresent()) return;
+    if (!SystemManager::canRunDriveActuator()) return;
 
     DCMotor &motor = dcMotors[payload->motorId];
     // Auto-switch to position mode. Only call enable() on mode change so
@@ -1008,7 +1028,7 @@ void MessageCenter::handleDCSetVelocity(const PayloadDCSetVelocity *payload)
 {
     if (payload->motorId >= NUM_DC_MOTORS)
         return;
-    if (!SensorManager::isBatteryPresent()) return;
+    if (!SystemManager::canRunDriveActuator()) return;
 
     DCMotor &motor = dcMotors[payload->motorId];
     if (motor.getMode() != DC_MODE_VELOCITY)
@@ -1022,7 +1042,7 @@ void MessageCenter::handleDCSetPWM(const PayloadDCSetPWM *payload)
 {
     if (payload->motorId >= NUM_DC_MOTORS)
         return;
-    if (!SensorManager::isBatteryPresent()) return;
+    if (!SystemManager::canRunDriveActuator()) return;
 
     DCMotor &motor = dcMotors[payload->motorId];
     if (motor.getMode() != DC_MODE_PWM)
@@ -1046,10 +1066,7 @@ void MessageCenter::handleStepEnable(const PayloadStepEnable *payload)
 
     if (payload->enable)
     {
-        // Enable only permitted in IDLE or RUNNING
-        SystemState st = SystemManager::getState();
-        if (st != SYS_STATE_IDLE && st != SYS_STATE_RUNNING) return;
-        if (!SensorManager::isBatteryPresent()) return;
+        if (!SystemManager::canEnableDriveActuator()) return;
         s->enable();
     }
     else
@@ -1104,11 +1121,8 @@ void MessageCenter::handleStepHome(const PayloadStepHome *payload)
 
 void MessageCenter::handleServoEnable(const PayloadServoEnable *payload)
 {
-    // Enable only permitted in RUNNING; disable always allowed
-    SystemState st = SystemManager::getState();
-    bool stateOk = (st == SYS_STATE_RUNNING);
-    bool powerOk = SensorManager::isBatteryPresent() || SensorManager::isServoRailPresent();
-    bool canEnable = stateOk && powerOk;
+    // Enable only permitted in RUNNING with battery power; disable always allowed
+    bool canEnable = SystemManager::canEnableServoActuator();
 
     if (payload->channel == 0xFF)
     {
@@ -1116,7 +1130,7 @@ void MessageCenter::handleServoEnable(const PayloadServoEnable *payload)
         if (payload->enable)
         {
             if (!canEnable) {
-                DEBUG_LOG.println(F("[SERVO] Enable rejected: no actuator power or invalid state."));
+                DEBUG_LOG.println(F("[SERVO] Enable rejected: battery absent or invalid state."));
                 return;
             }
             servoEnabledMask_ = 0xFFFF;
@@ -1137,7 +1151,7 @@ void MessageCenter::handleServoEnable(const PayloadServoEnable *payload)
         if (payload->enable)
         {
             if (!canEnable) {
-                DEBUG_LOG.println(F("[SERVO] Enable rejected: no actuator power or invalid state."));
+                DEBUG_LOG.println(F("[SERVO] Enable rejected: battery absent or invalid state."));
                 return;
             }
             servoEnabledMask_ |= bit;
@@ -1279,7 +1293,7 @@ void MessageCenter::sendDCStatusAll()
         s.velKd = dcMotors[i].getVelKd();
     }
 
-    appendTlv(DC_STATUS_ALL, sizeof(payload), &payload);
+    appendTelemetryTlv(DC_STATUS_ALL, sizeof(payload), &payload);
 }
 
 void MessageCenter::sendStepStatusAll()
@@ -1302,7 +1316,7 @@ void MessageCenter::sendStepStatusAll()
         s.acceleration = sm->getAcceleration();
     }
 
-    appendTlv(STEP_STATUS_ALL, sizeof(payload), &payload);
+    appendTelemetryTlv(STEP_STATUS_ALL, sizeof(payload), &payload);
 }
 
 void MessageCenter::sendServoStatusAll()
@@ -1325,7 +1339,7 @@ void MessageCenter::sendServoStatusAll()
         }
     }
 
-    appendTlv(SERVO_STATUS_ALL, sizeof(payload), &payload);
+    appendTelemetryTlv(SERVO_STATUS_ALL, sizeof(payload), &payload);
 }
 
 void MessageCenter::sendSensorIMU()
@@ -1354,60 +1368,32 @@ void MessageCenter::sendSensorIMU()
     payload.reserved = 0;
     payload.timestamp = micros();
 
-    appendTlv(SENSOR_IMU, sizeof(payload), &payload);
+    appendTelemetryTlv(SENSOR_IMU, sizeof(payload), &payload);
 }
 
-void MessageCenter::sendSensorRange(bool lidarOnly)
+void MessageCenter::sendUltrasonicRange()
 {
-    if (lidarOnly)
+    // Ultrasonic sensors (50 Hz path)
+    for (uint8_t i = 0; i < SensorManager::getUltrasonicConfiguredCount(); i++)
     {
-        // Lidar sensors (10 Hz path)
-        for (uint8_t i = 0; i < SensorManager::getLidarConfiguredCount(); i++)
+        PayloadSensorRange p;
+        p.sensorId = i;
+        p.sensorType = 0; // ultrasonic
+        p.reserved = 0;
+        p.reserved2 = 0;
+        p.timestamp = micros();
+        if (SensorManager::isUltrasonicFound(i))
         {
-            PayloadSensorRange p;
-            p.sensorId = i;
-            p.sensorType = 1; // lidar
-            p.reserved = 0;
-            p.reserved2 = 0;
-            p.timestamp = micros();
-            if (SensorManager::isLidarFound(i))
-            {
-                p.status = 0; // valid
-                p.distanceMm = SensorManager::getLidarDistanceMm(i);
-            }
-            else
-            {
-                p.status = 3; // not installed
-                p.distanceMm = 0;
-            }
-            if (!appendTlv(SENSOR_RANGE, sizeof(p), &p))
-                break;
+            p.status = 0; // valid
+            p.distanceMm = SensorManager::getUltrasonicDistanceMm(i);
         }
-    }
-    else
-    {
-        // Ultrasonic sensors (10 Hz path)
-        for (uint8_t i = 0; i < SensorManager::getUltrasonicConfiguredCount(); i++)
+        else
         {
-            PayloadSensorRange p;
-            p.sensorId = i;
-            p.sensorType = 0; // ultrasonic
-            p.reserved = 0;
-            p.reserved2 = 0;
-            p.timestamp = micros();
-            if (SensorManager::isUltrasonicFound(i))
-            {
-                p.status = 0; // valid
-                p.distanceMm = SensorManager::getUltrasonicDistanceMm(i);
-            }
-            else
-            {
-                p.status = 3; // not installed
-                p.distanceMm = 0;
-            }
-            if (!appendTlv(SENSOR_RANGE, sizeof(p), &p))
-                break;
+            p.status = 3; // not installed
+            p.distanceMm = 0;
         }
+        if (!appendTelemetryTlv(SENSOR_RANGE, sizeof(p), &p))
+            break;
     }
 }
 
@@ -1428,7 +1414,7 @@ void MessageCenter::sendSensorKinematics()
     payload.vTheta = RobotKinematics::getVTheta();
     payload.timestamp = micros();
 
-    appendTlv(SENSOR_KINEMATICS, sizeof(payload), &payload);
+    appendTelemetryTlv(SENSOR_KINEMATICS, sizeof(payload), &payload);
 }
 
 void MessageCenter::sendVoltageData()
@@ -1440,7 +1426,7 @@ void MessageCenter::sendVoltageData()
     payload.servoRailMv = (uint16_t)(SensorManager::getServoVoltage() * 1000.0f);
     payload.reserved = 0;
 
-    appendTlv(SENSOR_VOLTAGE, sizeof(payload), &payload);
+    appendTelemetryTlv(SENSOR_VOLTAGE, sizeof(payload), &payload);
 }
 
 void MessageCenter::sendIOStatus()
@@ -1462,7 +1448,7 @@ void MessageCenter::sendIOStatus()
     if (sendLen > sizeof(buf))
         sendLen = sizeof(buf);
 
-    appendTlv(IO_STATUS, sendLen, buf);
+    appendTelemetryTlv(IO_STATUS, sendLen, buf);
 }
 
 void MessageCenter::sendSystemStatus()
@@ -1495,7 +1481,7 @@ void MessageCenter::sendSystemStatus()
     if (!SensorManager::isIMUAvailable())
         payload.errorFlags |= ERR_IMU_ERROR;
 #endif
-    if (LoopMonitor::getFaultMask() != 0)
+    if (LoopMonitor::getLiveFaultMask() != 0)
         payload.errorFlags |= ERR_LOOP_OVERRUN;
     // Per-motor encoder stall: any failed motor sets the shared flag
     for (uint8_t i = 0; i < NUM_DC_MOTORS; i++) {
@@ -1504,11 +1490,9 @@ void MessageCenter::sendSystemStatus()
             break;
         }
     }
-    // Attached sensors bitmask: bit0=IMU, bit1=Lidar, bit2=Ultrasonic
+    // Attached sensors bitmask: bit0=IMU, bit1=reserved, bit2=Ultrasonic
     if (SensorManager::isIMUAvailable())
         payload.attachedSensors |= 0x01;
-    if (SensorManager::getLidarCount() > 0)
-        payload.attachedSensors |= 0x02;
     if (SensorManager::getUltrasonicCount() > 0)
         payload.attachedSensors |= 0x04;
 
@@ -1524,7 +1508,7 @@ void MessageCenter::sendSystemStatus()
     // 0xFF = no home limit GPIO configured for this stepper
     memset(payload.stepperHomeLimitGpio, 0xFF, sizeof(payload.stepperHomeLimitGpio));
 
-    appendTlv(SYS_STATUS, sizeof(payload), &payload);
+    appendTelemetryTlv(SYS_STATUS, sizeof(payload), &payload);
 }
 
 void MessageCenter::sendMagCalStatus()
@@ -1547,7 +1531,7 @@ void MessageCenter::sendMagCalStatus()
     payload.savedToEeprom = cal.savedToEeprom ? 1 : 0;
     memset(payload.reserved2, 0, sizeof(payload.reserved2));
 
-    appendTlv(SENSOR_MAG_CAL_STATUS, sizeof(payload), &payload);
+    appendTelemetryTlv(SENSOR_MAG_CAL_STATUS, sizeof(payload), &payload);
 }
 
 // ============================================================================
@@ -1573,11 +1557,22 @@ void MessageCenter::disableAllActuators()
     servoI2CFaultLogged_ = false;
 }
 
+void MessageCenter::cancelDeferredActions()
+{
+    deferredMagCalAction_ = DEFER_MAG_NONE;
+    pendingMagCal_ = false;
+}
+
 void MessageCenter::latchFaultFlags(uint8_t flags)
 {
     // OR-in the new flags so multiple faults accumulate.
     // Called from SafetyManager ISR — volatile write is atomic on AVR for uint8_t.
     faultLatchFlags_ |= flags;
+}
+
+void MessageCenter::clearFaultLatch()
+{
+    faultLatchFlags_ = 0;
 }
 
 uint16_t MessageCenter::getFreeRAM()

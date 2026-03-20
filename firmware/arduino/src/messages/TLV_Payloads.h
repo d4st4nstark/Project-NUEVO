@@ -457,7 +457,7 @@ struct PayloadSensorVoltage {
  */
 struct PayloadSensorRange {
     uint8_t  sensorId;      // Sensor index (0-based)
-    uint8_t  sensorType;    // 0 = ultrasonic, 1 = lidar
+    uint8_t  sensorType;    // 0 = ultrasonic, 1 = reserved for external lidar paths
     uint8_t  status;        // 0 = valid, 1 = out of range, 2 = sensor error, 3 = not installed
     uint8_t  reserved;      // Set to 0
     uint16_t distanceMm;    // Distance (mm); 0 if status ≠ 0

@@ -2,25 +2,31 @@
  * @file SystemManager.h
  * @brief Global firmware state machine — single source of truth for SystemState
  *
- * All modules that need to read or change system state include this header.
- * SafetyManager (hard RT) uses forceState(). MessageCenter and other soft
- * modules use requestTransition() which enforces FSM guards.
+ * All modules that need to read system state include this header.
+ * Transition policy lives here behind named trigger functions so the rules for
+ * START / STOP / RESET / ESTOP / safety faults stay in one place.
  *
  * Valid state transitions:
  *
- *   INIT    → IDLE         requestTransition  (setup() complete)
- *   IDLE    → RUNNING      requestTransition  (SYS_CMD_START)
- *   RUNNING → IDLE         requestTransition  (SYS_CMD_STOP)
- *   ERROR   → IDLE         requestTransition  (SYS_CMD_RESET)
- *   ESTOP   → IDLE         requestTransition  (SYS_CMD_RESET)
- *   any     → ESTOP        requestTransition  (SYS_CMD_ESTOP)
- *   any     → ERROR        forceState only    (SafetyManager hard RT fault)
+ *   INIT    → IDLE         triggerBootCompleted()
+ *   IDLE    → RUNNING      triggerStartCommand()
+ *   RUNNING → IDLE         triggerStopCommand()
+ *   ERROR   → IDLE         triggerResetCommand()
+ *   ESTOP   → IDLE         triggerResetCommand()
+ *   any     → ESTOP        triggerEstopCommand()
+ *   any     → ERROR        triggerSafetyFaultFromIsr()
+ *
+ * Actuator power policy:
+ *   - The firmware may enter RUNNING with no battery present.
+ *   - Actuator-enable commands are rejected while battery power is absent.
+ *   - Once battery power has been seen during a RUNNING session, losing it
+ *     or falling below safety thresholds triggers ERROR.
  *
  * Thread safety:
  *   state_ is declared volatile. getState() performs an atomic single-byte
- *   read (safe from any context). requestTransition() uses cli/sei to guard
- *   the read-modify-write. forceState() assumes interrupts are already
- *   disabled (ISR context) — do not call it from soft-scheduler code.
+ *   read (safe from any context). Internal transition helpers use cli/sei to
+ *   guard read-modify-write. The ISR fault path assumes interrupts are already
+ *   disabled by hardware.
  */
 
 #ifndef SYSTEMMANAGER_H
@@ -46,32 +52,113 @@ public:
     static SystemState getState();
 
     /**
-     * @brief Request a state transition with FSM guard.
+     * @brief Move the FSM from INIT to IDLE after setup() completes.
      *
-     * Only valid transitions (per the state diagram above) are accepted.
-     * The caller is responsible for any actuator cleanup that must accompany
-     * the transition (e.g., disabling motors on STOP or RESET).
-     *
-     * Uses cli/sei for an atomic read-modify-write. Do NOT call from an ISR
-     * where interrupts must remain disabled — use forceState() instead.
-     *
-     * @param  newState  Target state
      * @return true if transition was accepted and applied
      */
-    static bool requestTransition(SystemState newState);
+    static bool triggerBootCompleted();
 
     /**
-     * @brief Force a state change — bypasses FSM guards.
+     * @brief Handle SYS_CMD_START state policy.
      *
-     * Intended ONLY for the SafetyManager hard RT fault path.
-     * Must be called from within an ISR (interrupts already disabled by hw).
-     *
-     * @param s  New state to impose
+     * @return true if transition was accepted and applied
      */
-    static void forceState(SystemState s);
+    static bool triggerStartCommand();
+
+    /**
+     * @brief Handle SYS_CMD_STOP state policy.
+     *
+     * Disables actuators and cancels deferred command work on success.
+     *
+     * @return true if transition was accepted and applied
+     */
+    static bool triggerStopCommand();
+
+    /**
+     * @brief Handle SYS_CMD_RESET state policy.
+     *
+     * Disables actuators, clears deferred work, clears fault latches, and
+     * clears loop-monitor fault state on success.
+     *
+     * @return true if transition was accepted and applied
+     */
+    static bool triggerResetCommand();
+
+    /**
+     * @brief Handle SYS_CMD_ESTOP state policy.
+     *
+     * This always disables actuators and cancels deferred work before forcing
+     * the ESTOP transition.
+     *
+     * @return true if transition was accepted and applied
+     */
+    static bool triggerEstopCommand();
+
+    /**
+     * @brief Handle a hard safety fault from ISR context.
+     *
+     * This is the ISR-safe path for liveness / battery faults. It disables all
+     * actuators, latches the triggering error flags, and forces ERROR.
+     *
+     * @param triggerFlags  SystemErrorFlags bitmask describing the fault cause
+     */
+    static void triggerSafetyFaultFromIsr(uint8_t triggerFlags);
+
+    /**
+     * @brief True when DC/stepper enable commands are allowed to take effect.
+     *
+     * Policy:
+     *   - battery power must be present
+     *   - state must be IDLE or RUNNING
+     */
+    static bool canEnableDriveActuator();
+
+    /**
+     * @brief True when DC motion commands that auto-enable motors may take effect.
+     *
+     * Policy:
+     *   - battery power must be present
+     *   - state must be RUNNING
+     */
+    static bool canRunDriveActuator();
+
+    /**
+     * @brief True when servo enable commands are allowed to take effect.
+     *
+     * Policy:
+     *   - battery power must be present
+     *   - state must be RUNNING
+     */
+    static bool canEnableServoActuator();
+
+    /**
+     * @brief Heartbeat timeout only matters while RUNNING.
+     */
+    static bool shouldTripHeartbeatFault();
+
+    /**
+     * @brief Determine whether battery power should trigger a hard ERROR.
+     *
+     * RUNNING may begin without a battery. Once battery power has been seen in
+     * the current RUNNING session, losing it or crossing safety thresholds
+     * becomes a hard fault.
+     */
+    static bool shouldTripBatteryFault();
+
+    /**
+     * @brief Report the currently active battery-related error flags.
+     *
+     * Returns ERR_UNDERVOLTAGE and/or ERR_OVERVOLTAGE according to the current
+     * measured power state. Intended for safety-fault latching and status use.
+     */
+    static uint8_t getBatteryFaultFlags();
 
 private:
+    static bool requestTransition(SystemState newState);
+    static void forceState(SystemState s);
+    static void resetRunningPowerMonitor();
     static volatile SystemState state_;
+    static bool batteryFaultArmed_;
 };
 
 #endif // SYSTEMMANAGER_H

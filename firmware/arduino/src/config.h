@@ -2,8 +2,14 @@
  * @file config.h
  * @brief Central configuration for Arduino Mega 2560 firmware
  *
- * This file contains all compile-time parameters for hardware configuration,
- * timing, communication, and debug settings.
+ * This file contains the compile-time firmware configuration.
+ *
+ * Quick guide:
+ *   1. Most users should start with the "Quick Tune Settings" section.
+ *   2. The rest of the file contains hardware mapping, thresholds, and
+ *      advanced debug / bring-up settings.
+ *   3. Keep changes here behavioral only; avoid putting implementation logic
+ *      into config macros.
  */
 
 #ifndef CONFIG_H
@@ -13,7 +19,39 @@
 // FIRMWARE VERSION
 // ============================================================================
 
-#define FIRMWARE_VERSION        0x00080000  // Version 0.8.0 (Phase 8 - hard real-time ISR scheduler)
+#define FIRMWARE_VERSION        0x00090000  // Version 0.9.0
+
+// ============================================================================
+// QUICK TUNE SETTINGS
+// ============================================================================
+//
+// These are the settings most users are expected to touch first.
+// Battery chemistry / voltage thresholds are configured later in the dedicated
+// battery section below.
+
+// UART link to Raspberry Pi
+#define RPI_BAUD_RATE           250000  // Stable bring-up rate for Mega2560 <-> RPi
+#define HEARTBEAT_TIMEOUT_MS    500     // Disable actuators if heartbeat stops
+
+// Shared I2C bus (IMU / ultrasonic / PCA9685 servo controller)
+// Keep this conservative on the Mega because several devices share the same
+// bus and setup/runtime robustness matters more than peak throughput.
+#define I2C_BUS_CLOCK_HZ        100000
+#define I2C_WIRE_TIMEOUT_US     5000
+
+// Soft task cadences
+#define UART_COMMS_FREQ_HZ      50      // UART service task
+#define MOTOR_UPDATE_FREQ_HZ    200     // DC control compute round
+#define SENSOR_UPDATE_FREQ_HZ   100     // Sensor dispatch task
+#define USER_IO_FREQ_HZ         20      // LEDs / buttons / UI indications
+
+// Human-readable status output on USB serial
+#define STATUS_REPORTER_ENABLED 1       // 1 = emit [SYSTEM]/[TIMING]/[UART], 0 = disable
+#define STATUS_REPORT_HZ        1       // Report frequency when enabled
+
+// Debug serial
+#define DEBUG_BAUD_RATE         115200
+#define DEBUG_LOG_BUFFER_SIZE   1024
 
 // ============================================================================
 // HARDWARE CONFIGURATION
@@ -21,10 +59,6 @@
 
 // DC Motors
 #define NUM_DC_MOTORS           4       // Total DC motor channels
-#define DC_MOTOR_1              0       // DC motor index 1 (0-3)
-#define DC_MOTOR_2              1       // DC motor index 2 (0-3)
-#define DC_MOTOR_3              2       // DC motor index 3 (0-3)
-#define DC_MOTOR_4              3       // DC motor index 4 (0-3)
 
 // All DC motor channels are always initialized. Use DC_ENABLE TLV command at
 // runtime to activate specific motors. Set NUM_DC_MOTORS to reduce channel count.
@@ -38,10 +72,6 @@
 
 // Stepper Motors
 #define NUM_STEPPERS            4       // Total stepper channels
-#define STEPPER_1               0       // Stepper index 1 (0-3)
-#define STEPPER_2               1       // Stepper index 2 (0-3)
-#define STEPPER_3               2       // Stepper index 3 (0-3)
-#define STEPPER_4               3       // Stepper index 4 (0-3)
 
 // All stepper channels are always initialized. Use STEP_ENABLE TLV command at
 // runtime to activate specific steppers. Set NUM_STEPPERS to reduce channel count.
@@ -81,22 +111,10 @@
 
 // Control and sensor scheduling frequencies
 #define DC_PID_FREQ_HZ          800     // DC motor Timer1 round-robin slot (1.25 ms; 200 Hz per motor)
-#define UART_COMMS_FREQ_HZ      50      // UART task rate in loop() (20 ms bring-up profile)
-#define MOTOR_UPDATE_FREQ_HZ    200     // DC motor soft task rate (5 ms)
-#define SENSOR_UPDATE_FREQ_HZ   100     // Sensor soft task tick (10 ms)
-#define SENSOR_LIDAR_FREQ_HZ    50      // Lidar cadence inside sensor task (20 ms)
-#define SENSOR_ULTRASONIC_FREQ_HZ 10   // Ultrasonic cadence inside sensor task (100 ms)
-#define SENSOR_VOLTAGE_FREQ_HZ  10      // Voltage cadence inside sensor task (100 ms)
-
-// Soft real-time frequencies (millis-based, loop-driven)
-#define USER_IO_FREQ_HZ         20      // LED/button update (50 ms)
 
 // Stepper pulse generation (Timer3)
 #define STEPPER_TIMER_FREQ_HZ   10000   // 10kHz interrupt rate (100µs period)
 #define STEPPER_MAX_RATE_SPS    5000    // Maximum steps per second per motor
-
-// Safety timeout
-#define HEARTBEAT_TIMEOUT_MS    500     // Disable motors if no heartbeat
 
 // ============================================================================
 // FAULT DETECTION THRESHOLDS
@@ -132,22 +150,29 @@
 // ============================================================================
 
 // UART to Raspberry Pi (Serial2)
-#define RPI_BAUD_RATE           250000  // Conservative bring-up UART baud rate to Raspberry Pi
 #define RPI_SERIAL              Serial2 // Hardware serial port
 
-// Debug serial (Serial0 - USB)
-#define DEBUG_BAUD_RATE         115200
-#define DEBUG_SERIAL            Serial
-#define DEBUG_LOG_BUFFER_SIZE   1024
-#define DEBUG_STATUS_STREAM_HZ  1
-#define TELEMETRY_DC_STATUS_MS       200
-#define TELEMETRY_STEP_STATUS_MS     1000
-#define TELEMETRY_SERVO_STATUS_MS    500
-#define TELEMETRY_IMU_MS             500
-#define TELEMETRY_KINEMATICS_MS      500
-#define TELEMETRY_IO_STATUS_MS       500
-#define TELEMETRY_LIDAR_MS           1000
-#define TELEMETRY_ULTRASONIC_MS      1000
+// USB debug console
+//
+// DEBUG_SERIAL_PORT is the raw USB serial device (Serial0). DEBUG_SERIAL is a
+// Print-compatible handle routed through DebugLog so normal DEBUG_SERIAL.print*
+// calls are buffered during runtime. setup() temporarily enables passthrough so
+// early bring-up prints still appear immediately on USB.
+class HardwareSerial;
+class Print;
+extern HardwareSerial &DEBUG_SERIAL_PORT;
+extern Print &DEBUG_SERIAL;
+
+// TLV telemetry streaming periods to the Raspberry Pi.
+// Effective ceiling: periodic telemetry is sent from taskUART(), so with the
+// default UART_COMMS_FREQ_HZ = 50 the fastest practical interval is 20 ms.
+#define TELEMETRY_DC_STATUS_MS       20
+#define TELEMETRY_STEP_STATUS_MS     200
+#define TELEMETRY_SERVO_STATUS_MS    200
+#define TELEMETRY_IMU_MS             20
+#define TELEMETRY_KINEMATICS_MS      20
+#define TELEMETRY_IO_STATUS_MS       20
+#define TELEMETRY_ULTRASONIC_MS      20
 #define TELEMETRY_VOLTAGE_MS         1000
 #define TELEMETRY_SYS_STATUS_RUN_MS  1000
 #define TELEMETRY_SYS_STATUS_IDLE_MS 1000
@@ -179,11 +204,6 @@
 #define DEFAULT_VEL_KI          4.0f
 #define DEFAULT_VEL_KD          0.0f
 
-// Torque PID (inner loop - not used for now)
-#define DEFAULT_TRQ_KP          0.2f
-#define DEFAULT_TRQ_KI          0.05f
-#define DEFAULT_TRQ_KD          0.0f
-
 // PID output limits
 #define PID_OUTPUT_MIN          -255    // Minimum PWM value
 #define PID_OUTPUT_MAX          255     // Maximum PWM value
@@ -193,7 +213,7 @@
 // ============================================================================
 
 // IMU (ICM-20948 via SparkFun library + Fusion AHRS)
-#define IMU_ENABLED             0
+#define IMU_ENABLED             1
 // AD0_VAL: 0 = I2C addr 0x68 (AD0 pin LOW), 1 = I2C addr 0x69 (AD0 pin HIGH)
 #define IMU_AD0_VAL             1       // SparkFun breakout default: AD0 high = 0x69
 
@@ -206,13 +226,9 @@
 // Recovery trigger period: seconds before algorithm exits recovery mode
 #define FUSION_RECOVERY_PERIOD  5       // seconds
 
-// Lidar (Garmin LIDAR-Lite v4, via I2C)
-#define LIDAR_COUNT             0       // Number of attached lidar sensors (0 to disable)
-// Up to 4 lidar sensors at different I2C addresses (change with address jumper)
-#define LIDAR_0_I2C_ADDR        0x62    // Default LIDAR-Lite v4 address
-#define LIDAR_1_I2C_ADDR        0x63
-#define LIDAR_2_I2C_ADDR        0x64
-#define LIDAR_3_I2C_ADDR        0x65
+// Lidar (Garmin LIDAR-Lite v4)
+// Note: this lidar is not supported on the Arduino firmware. Use the RPi-side
+// Qwiic bus and the Pi test tooling in ros2_ws/tests if the lidar is needed.
 
 // Ultrasonic (SparkFun Qwiic HC-SR04, via I2C)
 #define ULTRASONIC_COUNT        0       // Number of attached ultrasonic sensors (0 to disable)
@@ -343,27 +359,11 @@
 #define ADC_RESOLUTION          1024    // 10-bit ADC
 
 // ============================================================================
-// DC MOTOR CURRENT SENSING
-// ============================================================================
-
-// Current sensor configuration
-// Hardware: CT Output voltage (V) = Current (A) × 0.155
-// Scaling: 0.155 V/A = 155 mV/A = 0.155 mV/mA
-// Conversion: Current (mA) = Voltage (V) × (1000 / 0.155) = Voltage × 6451.6
-#define CURRENT_SENSE_MA_PER_VOLT   6451.6f  // milliamps per volt (1/0.155 × 1000)
-
-// ============================================================================
 // NEOPIXEL CONFIGURATION
 // ============================================================================
 
 #define NEOPIXEL_COUNT          1       // Number of WS2812B LEDs
 #define NEOPIXEL_BRIGHTNESS     64      // Default brightness (0-255)
-
-// System status colors (first pixel reserved for status indication)
-#define STATUS_COLOR_OK         0x00FF00  // Green - normal operation
-#define STATUS_COLOR_LOW_BAT    0xFF0000  // Red - low battery
-#define STATUS_COLOR_ERROR      0xFF8800  // Orange - error state
-#define STATUS_COLOR_DISABLED   0x000000  // Off - motors disabled
 
 // ============================================================================
 // LIMIT SWITCH CONFIGURATION
@@ -390,7 +390,7 @@
 // #define DEBUG_MOTOR_PID         // Print PID debug info to Serial
 // #define DEBUG_ENCODER           // Print encoder counts to Serial
 // #define DEBUG_TLV_PACKETS       // Print TLV packet info to Serial
-// #define DEBUG_UART_RX_BYTES       // Print every raw byte received on Serial2
+// #define DEBUG_UART_RX_BYTES     // Print every raw byte received on Serial2
 // #define DEBUG_VELOCITY          // Print velocity estimation debug info
 // #define DEBUG_SCHEDULER         // Print scheduler task execution info
 
@@ -464,6 +464,10 @@
 
 #if (ENCODER_4_MODE != ENCODER_2X && ENCODER_4_MODE != ENCODER_4X)
   #error "ENCODER_4_MODE must be ENCODER_2X or ENCODER_4X"
+#endif
+
+#if STATUS_REPORTER_ENABLED && (STATUS_REPORT_HZ < 1)
+  #error "STATUS_REPORT_HZ must be >= 1 when STATUS_REPORTER_ENABLED=1"
 #endif
 
 #endif // CONFIG_H
