@@ -2,7 +2,7 @@
  * @file UserIO.cpp
  * @brief Implementation of user I/O management
  *
- * LED_RED PWM (v0.8.0+)
+ * LED_RED PWM (v0.9.0 profile)
  * ---------------------
  * LED_RED uses direct OCR writes (via the LED_RED_OCR / LED_RED_ICR macros
  * defined in pins.h) instead of analogWrite(). This resolves the previously
@@ -12,11 +12,12 @@
  *   Rev A: LED_RED on pin 11 — Timer1 OC1A — LED_RED_OCR = OCR1A
  *   Rev B: LED_RED on pin 5  — Timer3 OC3A — LED_RED_OCR = OCR3A
  *
- * See: firmware/notes/TIMER3_CONFLICT_ANALYSIS.md (marked RESOLVED v0.8.0)
+ * See: firmware/docs/TIMER3_CONFLICT_ANALYSIS.md
  */
 
 #include "UserIO.h"
 #include "../pins.h"
+#include "SensorManager.h"
 #include "../SystemManager.h"
 
 // ============================================================================
@@ -29,12 +30,55 @@ UserIO::LEDState UserIO::leds_[LED_COUNT];
 
 volatile uint16_t UserIO::buttonStates_     = 0;
 volatile uint16_t UserIO::prevButtonStates_ = 0;
-uint8_t  UserIO::limitStates_    = 0;
-uint8_t  UserIO::animPhase_      = 0;
-SystemState UserIO::lastAnimState_ = SYS_STATE_INIT;
-bool     UserIO::neoAutoAnimate_ = true;
+uint8_t               UserIO::limitStates_     = 0;
+uint8_t               UserIO::animPhase_       = 0;
+volatile SystemState  UserIO::pixelState_      = SYS_STATE_INIT;
+volatile bool         UserIO::pixelStateDirty_ = true;
+bool                  UserIO::neoAutoAnimate_  = true;
 
 bool UserIO::initialized_ = false;
+
+namespace {
+
+void disconnectRedLedPwm()
+{
+#if defined(PIN_LED_RED_IS_OC1A)
+    TCCR1A &= (uint8_t)~((1 << COM1A1) | (1 << COM1A0));
+#elif defined(PIN_LED_RED_IS_OC3A)
+    TCCR3A &= (uint8_t)~((1 << COM3A1) | (1 << COM3A0));
+#endif
+}
+
+void connectRedLedPwm()
+{
+#if defined(PIN_LED_RED_IS_OC1A)
+    TCCR1A = (uint8_t)((TCCR1A & (uint8_t)~(1 << COM1A0)) | (1 << COM1A1));
+#elif defined(PIN_LED_RED_IS_OC3A)
+    TCCR3A = (uint8_t)((TCCR3A & (uint8_t)~(1 << COM3A0)) | (1 << COM3A1));
+#endif
+}
+
+void applyRedLedLevel(uint8_t brightness)
+{
+    if (brightness == 0U) {
+        LED_RED_OCR = 0;
+        disconnectRedLedPwm();
+        digitalWrite(PIN_LED_RED, LOW);
+        return;
+    }
+
+    if (brightness >= 255U) {
+        LED_RED_OCR = LED_RED_ICR;
+        disconnectRedLedPwm();
+        digitalWrite(PIN_LED_RED, HIGH);
+        return;
+    }
+
+    connectRedLedPwm();
+    LED_RED_OCR = (uint16_t)(((uint32_t)brightness * (uint32_t)LED_RED_ICR) / 255UL);
+}
+
+} // namespace
 
 // ============================================================================
 // INITIALIZATION
@@ -52,8 +96,7 @@ void UserIO::init() {
     leds_[LED_RED].pin = PIN_LED_RED;
     leds_[LED_RED].mode = LED_OFF;
     pinMode(PIN_LED_RED, OUTPUT);
-    LED_RED_OCR = 0;  // Timer3 Fast PWM — must zero OCR explicitly, not just digitalWrite
-    digitalWrite(PIN_LED_RED, LOW);
+    applyRedLedLevel(0);
 
     leds_[LED_GREEN].pin = PIN_LED_GREEN;
     leds_[LED_GREEN].mode = LED_OFF;
@@ -86,14 +129,13 @@ void UserIO::init() {
 
     // Initialize NeoPixel
     neopixel_.init(PIN_NEOPIXEL, 1, 128);  // 1 LED, 50% brightness
-    neopixel_.setPixel(0, STATUS_IDLE);    // Start with blue (idle)
-    neopixel_.show();
+    queuePixelState(SystemManager::getState());
 
-    // Read initial button states (readButtons() is the ISR-callable version)
-    readButtons();
-    updateLimitSwitches();
+    // Prime input caches so button/limit status is valid immediately.
+    sampleInputs();
 
     initialized_ = true;
+    updateNeoPixelAnimation();
 
 #ifdef DEBUG_USERIO
     DEBUG_SERIAL.println(F("[UserIO] Initialized"));
@@ -110,10 +152,68 @@ void UserIO::init() {
 void UserIO::update() {
     if (!initialized_) return;
 
-    // Note: button reads moved to readButtons() called from TIMER1 ISR at 100 Hz
-    updateLimitSwitches();
     updateLEDs();
     updateNeoPixelAnimation();
+}
+
+void UserIO::sampleInputs() {
+    if (!initialized_) return;
+
+    readButtons();
+
+    limitStates_ = 0;
+    for (uint8_t i = 0; i < 8; i++) {
+        uint8_t activeState = LIMIT_ACTIVE_LOW ? LOW : HIGH;
+        if (digitalRead(LIMIT_PINS[i]) == activeState) {
+            limitStates_ |= (uint8_t)(1u << i);
+        }
+    }
+}
+
+void UserIO::serviceTask() {
+    if (!initialized_) return;
+
+    update();
+}
+
+void UserIO::syncOutputs() {
+    if (!initialized_) return;
+
+    for (uint8_t i = 0; i < LED_COUNT; i++) {
+        LEDState& led = leds_[i];
+        switch (led.mode) {
+            case LED_OFF:
+                if (led.pin == PIN_LED_RED) {
+                    applyRedLedLevel(0);
+                } else {
+                    digitalWrite(led.pin, LOW);
+                }
+                led.state = false;
+                break;
+
+            case LED_ON:
+            case LED_PWM:
+                if (led.pin == PIN_LED_RED) {
+                    applyRedLedLevel(led.brightness);
+                    led.state = (led.brightness != 0U);
+                } else if (led.mode == LED_PWM) {
+                    analogWrite(led.pin, led.brightness);
+                    led.state = (led.brightness != 0U);
+                } else {
+                    digitalWrite(led.pin, HIGH);
+                    led.state = true;
+                }
+                break;
+
+            case LED_BLINK:
+            case LED_BREATHE:
+                updateLED(led);
+                break;
+
+            default:
+                break;
+        }
+    }
 }
 
 // ============================================================================
@@ -171,24 +271,27 @@ void UserIO::setLED(LEDId ledId, LEDMode mode, uint8_t brightness, uint16_t peri
 
     // Immediately apply state for OFF, ON, and PWM modes
     if (mode == LED_OFF) {
-        // LED_RED uses Timer3 Fast PWM — digitalWrite() alone doesn't suppress the
-        // hardware PWM output. Zero the OCR register explicitly to ensure 0% duty cycle.
         if (led.pin == PIN_LED_RED) {
-            LED_RED_OCR = 0;
+            applyRedLedLevel(0);
+        } else {
+            digitalWrite(led.pin, LOW);
         }
-        digitalWrite(led.pin, LOW);
         led.state = false;
     } else if (mode == LED_ON) {
-        digitalWrite(led.pin, HIGH);
-        led.state = true;
-    } else if (mode == LED_PWM) {
-        // LED_RED uses a direct OCR write — analogWrite() would corrupt the timer.
         if (led.pin == PIN_LED_RED) {
-            LED_RED_OCR = ((uint16_t)brightness * LED_RED_ICR) / 255;
+            applyRedLedLevel(brightness);
+            led.state = (brightness != 0U);
+        } else {
+            digitalWrite(led.pin, HIGH);
+            led.state = true;
+        }
+    } else if (mode == LED_PWM) {
+        if (led.pin == PIN_LED_RED) {
+            applyRedLedLevel(brightness);
         } else {
             analogWrite(led.pin, brightness);
         }
-        led.state = true;
+        led.state = (brightness != 0U);
     }
 }
 
@@ -206,12 +309,27 @@ uint8_t UserIO::getLEDBrightness(uint8_t ledId) {
 }
 
 // ============================================================================
-// NEOPIXEL SYSTEM STATUS
+// NEOPIXEL SYSTEM STATE
 // ============================================================================
 
-void UserIO::setSystemStatus(uint32_t status) {
-    neopixel_.setPixel(0, status);
-    neopixel_.show();
+void UserIO::setPixelStateInit() {
+    queuePixelState(SYS_STATE_INIT);
+}
+
+void UserIO::setPixelStateIdle() {
+    queuePixelState(SYS_STATE_IDLE);
+}
+
+void UserIO::setPixelStateRunning() {
+    queuePixelState(SYS_STATE_RUNNING);
+}
+
+void UserIO::setPixelStateError() {
+    queuePixelState(SYS_STATE_ERROR);
+}
+
+void UserIO::setPixelStateEstop() {
+    queuePixelState(SYS_STATE_ESTOP);
 }
 
 void UserIO::setNeoPixelColor(uint32_t color) {
@@ -231,6 +349,9 @@ void UserIO::setNeoPixelBrightness(uint8_t brightness) {
 
 void UserIO::setNeoAutoAnimate(bool enable) {
     neoAutoAnimate_ = enable;
+    if (enable) {
+        pixelStateDirty_ = true;
+    }
 }
 
 // ============================================================================
@@ -238,7 +359,7 @@ void UserIO::setNeoAutoAnimate(bool enable) {
 // ============================================================================
 
 void UserIO::readButtons() {
-    // Pure GPIO reads — no millis(), no blocking. ISR-safe.
+    // Pure GPIO reads — no millis(), no blocking.
     // Snapshot previous before overwriting (used by wasButtonPressed()).
     prevButtonStates_ = buttonStates_;
     uint16_t states = 0;
@@ -250,19 +371,6 @@ void UserIO::readButtons() {
         }
     }
     buttonStates_ = states;
-}
-
-void UserIO::updateLimitSwitches() {
-    limitStates_ = 0;
-
-    // Read all limit switch states
-    for (uint8_t i = 0; i < 8; i++) {
-        // Limit switches share pins with buttons 3-10
-        uint8_t activeState = LIMIT_ACTIVE_LOW ? LOW : HIGH;
-        if (digitalRead(LIMIT_PINS[i]) == activeState) {
-            limitStates_ |= (1 << i);
-        }
-    }
 }
 
 void UserIO::updateLEDs() {
@@ -291,10 +399,8 @@ void UserIO::updateLED(LEDState& led) {
             if (now - led.lastToggle >= led.periodMs / 2) {
                 led.lastToggle = now;
                 led.state = !led.state;
-                // LED_RED is controlled by Timer3 OC3A — digitalWrite() has no effect
-                // when COM3A1 is set. Use direct OCR write instead.
                 if (led.pin == PIN_LED_RED) {
-                    LED_RED_OCR = led.state ? ((uint16_t)led.brightness * LED_RED_ICR) / 255 : 0;
+                    applyRedLedLevel(led.state ? led.brightness : 0);
                 } else {
                     digitalWrite(led.pin, led.state ? HIGH : LOW);
                 }
@@ -321,12 +427,8 @@ void UserIO::updateLED(LEDState& led) {
             // Apply per-LED brightness ceiling
             brightness = (uint8_t)((brightness * led.brightness) / 255);
 
-            // Apply to hardware:
-            //   LED_RED    → direct OCR write (Timer1 OC1A / Timer3 OC3A)
-            //   LED_PURPLE → digital ON/OFF (non-PWM pin)
-            //   Others     → analogWrite() safe on Timer2/5
             if (led.pin == PIN_LED_RED) {
-                LED_RED_OCR = ((uint16_t)brightness * LED_RED_ICR) / 255;
+                applyRedLedLevel(brightness);
             } else if (led.pin == PIN_LED_PURPLE) {
                 digitalWrite(led.pin, (brightness > 128) ? HIGH : LOW);
             } else {
@@ -369,16 +471,12 @@ void UserIO::hsvToRgb(uint8_t h, uint8_t s, uint8_t v,
 void UserIO::updateNeoPixelAnimation() {
     if (!neoAutoAnimate_) return;   // manual color control active — don't override
 
-    SystemState state = SystemManager::getState();
-
-    // Bring-up profile: keep the NeoPixel as a static state indicator only.
-    // Adafruit_NeoPixel::show() masks interrupts briefly, so avoid steady-state
-    // animations while validating UART liveness.
-    if (state == lastAnimState_) {
+    if (!pixelStateDirty_) {
         return;
     }
 
-    lastAnimState_ = state;
+    SystemState state = pixelState_;
+    pixelStateDirty_ = false;
     animPhase_ = 0;
 
     uint8_t r = 0;
@@ -387,19 +485,19 @@ void UserIO::updateNeoPixelAnimation() {
 
     switch (state) {
         case SYS_STATE_INIT:
-            r = 255; g = 180; b = 0;
+            r = 0; g = 80; b = 220;
             break;
         case SYS_STATE_IDLE:
-            r = 0; g = 90; b = 25;
+            r = 200; g = 230; b = 0;
             break;
         case SYS_STATE_RUNNING:
-            r = 0; g = 120; b = 140;
+            r = 0; g = 220; b = 40;
             break;
         case SYS_STATE_ERROR:
             r = 255; g = 0; b = 0;
             break;
         case SYS_STATE_ESTOP:
-            r = 255; g = 0; b = 40;
+            r = 255; g = 0; b = 80;
             break;
         default:
             b = 30;
@@ -408,4 +506,10 @@ void UserIO::updateNeoPixelAnimation() {
 
     neopixel_.setPixel(0, r, g, b);
     neopixel_.show();
+}
+
+void UserIO::queuePixelState(SystemState state) {
+    pixelState_ = state;
+    pixelStateDirty_ = true;
+    animPhase_ = 0;
 }

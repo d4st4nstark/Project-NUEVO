@@ -15,7 +15,7 @@
 #pragma once
 
 // clang-format off
-#include <SparkFun_Toolkit.h>
+#include "../../SparkFun_Toolkit/src/SparkFun_Toolkit.h"
 #include "sfTk/sfDevUltrasonicDist.h"
 #include "Arduino.h"
 #include <Wire.h>

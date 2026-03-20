@@ -22,31 +22,23 @@ void SafetyManager::check() {
 
     // Heartbeat loss is only a fault while RUNNING:
     // In IDLE, no RPi contact is expected (robot may be tethered or stopped).
-    bool heartbeatFault = (state == SYS_STATE_RUNNING) &&
+    bool heartbeatFault = SystemManager::shouldTripHeartbeatFault() &&
                           !MessageCenter::isHeartbeatValid();
 
-    // Battery faults apply in IDLE and RUNNING — prevent motor enable on bad power
-    bool batteryFault = SensorManager::isBatteryCritical() ||
-                        SensorManager::isBatteryOvervoltage();
+    // Battery faults are armed and interpreted by SystemManager.
+    bool batteryFault = SystemManager::shouldTripBatteryFault();
 
     // Common case: all OK — return immediately
     if (!heartbeatFault && !batteryFault) return;
 
     // ── Fault response ────────────────────────────────────────────────────────
 
-    // 1. Build the flag bitmask NOW — before forceState() changes the state.
-    //    (After forceState the state is ERROR, so RUNNING-gated checks would miss.)
+    // Build the trigger bitmask before changing state so the original cause
+    // is preserved in the latched SYS_STATUS error flags.
     uint8_t triggerFlags = 0;
     if (heartbeatFault)                      triggerFlags |= ERR_LIVENESS_LOST;
-    if (SensorManager::isBatteryCritical())  triggerFlags |= ERR_UNDERVOLTAGE;
-    if (SensorManager::isBatteryOvervoltage()) triggerFlags |= ERR_OVERVOLTAGE;
+    triggerFlags |= SystemManager::getBatteryFaultFlags();
 
-    // 2. Disable all actuators atomically (DC motors, steppers, servos)
-    MessageCenter::disableAllActuators();
-
-    // 3. Latch the flags so SYS_STATUS keeps reporting the cause while in ERROR
-    MessageCenter::latchFaultFlags(triggerFlags);
-
-    // 4. Force ERROR state (bypasses FSM guard — interrupts already disabled by hardware)
-    SystemManager::forceState(SYS_STATE_ERROR);
+    // Let SystemManager own the ERROR transition policy and shutdown sequence.
+    SystemManager::triggerSafetyFaultFromIsr(triggerFlags);
 }

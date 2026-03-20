@@ -8,6 +8,8 @@
 #include "SensorManager.h"
 #include "PersistentStorage.h"
 #include "../pins.h"
+#include "../utility.h"
+#include <Wire.h>
 
 // ============================================================================
 // STATIC MEMBER INITIALIZATION
@@ -18,14 +20,13 @@ FusionWrapper SensorManager::fusion_(SENSOR_UPDATE_FREQ_HZ, 2000.0f);
 
 bool     SensorManager::imuInitialized_ = false;
 uint32_t SensorManager::lastImuMicros_  = 0;
+uint16_t SensorManager::imuTimingAvgUs_ = 0;
+uint16_t SensorManager::imuTimingPeakUs_ = 0;
+uint16_t SensorManager::imuTimingMaxUs_ = 0;
 
-LidarDriver      SensorManager::lidars_[SENSOR_MAX_LIDARS];
 UltrasonicDriver SensorManager::ultrasonics_[SENSOR_MAX_ULTRASONICS];
-uint8_t          SensorManager::lidarCount_        = 0;
 uint8_t          SensorManager::ultrasonicCount_   = 0;
-bool             SensorManager::lidarFound_[SENSOR_MAX_LIDARS]             = {};
 bool             SensorManager::ultrasonicFound_[SENSOR_MAX_ULTRASONICS]   = {};
-uint16_t         SensorManager::lidarDistMm_[SENSOR_MAX_LIDARS]            = {};
 uint16_t         SensorManager::ultrasonicDistMm_[SENSOR_MAX_ULTRASONICS]  = {};
 
 float   SensorManager::batteryVoltage_   = 0.0f;
@@ -42,15 +43,36 @@ MagCalData SensorManager::magCal_ = {
 bool     SensorManager::initialized_   = false;
 uint32_t SensorManager::updateCount_   = 0;
 uint32_t SensorManager::lastUpdateTime_ = 0;
+uint16_t SensorManager::ultrasonicTimingAvgUs_ = 0;
+uint16_t SensorManager::ultrasonicTimingPeakUs_ = 0;
+uint16_t SensorManager::ultrasonicTimingMaxUs_ = 0;
 
 // I2C addresses for configured sensors (from config.h)
-static const uint8_t kLidarAddrs[4] = {
-    LIDAR_0_I2C_ADDR, LIDAR_1_I2C_ADDR, LIDAR_2_I2C_ADDR, LIDAR_3_I2C_ADDR
-};
 static const uint8_t kUltrasonicAddrs[4] = {
     ULTRASONIC_0_I2C_ADDR, ULTRASONIC_1_I2C_ADDR,
     ULTRASONIC_2_I2C_ADDR, ULTRASONIC_3_I2C_ADDR
 };
+
+namespace {
+
+void recordTiming(uint16_t elapsedUs,
+                  uint16_t &avgUs,
+                  uint16_t &peakUs,
+                  uint16_t &maxUs) {
+    if (avgUs == 0U) {
+        avgUs = elapsedUs;
+    } else {
+        avgUs = (uint16_t)(((uint32_t)avgUs * 7U + (uint32_t)elapsedUs) >> 3);
+    }
+    if (elapsedUs > peakUs) {
+        peakUs = elapsedUs;
+    }
+    if (elapsedUs > maxUs) {
+        maxUs = elapsedUs;
+    }
+}
+
+} // namespace
 
 // ============================================================================
 // INITIALIZATION
@@ -58,6 +80,13 @@ static const uint8_t kUltrasonicAddrs[4] = {
 
 void SensorManager::init() {
     if (initialized_) return;
+
+    // Bring up the shared I2C bus before any sensor or servo driver touches it.
+    // A wire timeout is essential here: without it, a sick device can hold
+    // setup() or the sensor task forever and starve UART servicing.
+    Wire.begin();
+    Wire.setClock(I2C_BUS_CLOCK_HZ);
+    Wire.setWireTimeout(I2C_WIRE_TIMEOUT_US, true);
 
     // ADC reference: use default (AVCC = 5 V)
     analogReference(DEFAULT);
@@ -87,28 +116,6 @@ void SensorManager::init() {
     } else {
 #ifdef DEBUG_SENSOR
         DEBUG_SERIAL.println(F("[SensorManager] WARNING: IMU not detected"));
-#endif
-    }
-#endif
-
-    // --- Lidar sensors ---
-#if LIDAR_COUNT > 0
-    lidarCount_ = 0;
-    for (uint8_t i = 0; i < LIDAR_COUNT && i < SENSOR_MAX_LIDARS; i++) {
-        lidarFound_[i] = lidars_[i].init(kLidarAddrs[i]);
-        if (lidarFound_[i]) {
-            lidarCount_++;
-        }
-#ifdef DEBUG_SENSOR
-        if (lidarFound_[i]) {
-            DEBUG_SERIAL.print(F("[SensorManager] Lidar "));
-            DEBUG_SERIAL.print(i);
-            DEBUG_SERIAL.println(F(": OK"));
-        } else {
-            DEBUG_SERIAL.print(F("[SensorManager] WARNING: Lidar "));
-            DEBUG_SERIAL.print(i);
-            DEBUG_SERIAL.println(F(" not detected (configured but missing)"));
-        }
 #endif
     }
 #endif
@@ -157,8 +164,8 @@ void SensorManager::tick() {
     lastUpdateTime_ = millis();
     updateCount_++;
 
-    update100Hz();                        // every tick    (100 Hz)
-    if ((counter & 1) == 0) update50Hz(); // even ticks   ( 50 Hz)
+    update100Hz();                         // every tick    (100 Hz)
+    if ((counter & 1) == 0) update50Hz();  // even ticks   ( 50 Hz)
     if (counter == 0)        update10Hz(); // tick 0 only  ( 10 Hz)
 
     if (++counter >= 10) counter = 0;
@@ -174,9 +181,9 @@ void SensorManager::isrTick() {
 
 void SensorManager::update100Hz() {
 #if IMU_ENABLED
-    if (!imuInitialized_ || !imu_.dataReady()) return;
-
-    imu_.update();
+    if (!imuInitialized_) return;
+    uint32_t imuStartUs = micros();
+    if (!imu_.update(true)) return;
 
     uint32_t now   = micros();
     float    dtSec = (now - lastImuMicros_) * 1e-6f;
@@ -210,33 +217,37 @@ void SensorManager::update100Hz() {
     if (magCal_.state == MAG_CAL_SAMPLING) {
         updateMagCalSampling();
     }
+
+    recordTiming(Utility::clampElapsedUs(micros() - imuStartUs),
+                 imuTimingAvgUs_,
+                 imuTimingPeakUs_,
+                 imuTimingMaxUs_);
 #endif
 }
 
 // ============================================================================
-// update50Hz — Lidar reads (50 Hz)
+// update50Hz — Ultrasonic reads (50 Hz)
 // ============================================================================
 
 void SensorManager::update50Hz() {
-    for (uint8_t i = 0; i < LIDAR_COUNT && i < SENSOR_MAX_LIDARS; i++) {
-        if (lidarFound_[i]) {
-            lidarDistMm_[i] = lidars_[i].getDistanceMm();
-        }
-    }
-}
-
-// ============================================================================
-// update10Hz — Voltages + Ultrasonic (10 Hz)
-// ============================================================================
-
-void SensorManager::update10Hz() {
-    updateVoltages();
-
+    uint32_t ultrasonicStartUs = micros();
     for (uint8_t i = 0; i < ULTRASONIC_COUNT && i < SENSOR_MAX_ULTRASONICS; i++) {
         if (ultrasonicFound_[i]) {
             ultrasonicDistMm_[i] = ultrasonics_[i].getDistanceMm();
         }
     }
+    recordTiming(Utility::clampElapsedUs(micros() - ultrasonicStartUs),
+                 ultrasonicTimingAvgUs_,
+                 ultrasonicTimingPeakUs_,
+                 ultrasonicTimingMaxUs_);
+}
+
+// ============================================================================
+// update10Hz — Voltages (10 Hz)
+// ============================================================================
+
+void SensorManager::update10Hz() {
+    updateVoltages();
 }
 
 // ============================================================================
@@ -260,32 +271,27 @@ int16_t SensorManager::getRawGyrZ() { return imu_.getRawGyrZ(); }
 int16_t SensorManager::getRawMagX() { return imu_.getRawMagX(); }
 int16_t SensorManager::getRawMagY() { return imu_.getRawMagY(); }
 int16_t SensorManager::getRawMagZ() { return imu_.getRawMagZ(); }
+int16_t SensorManager::getRawTempDeciC() { return (int16_t)(imu_.getTemp() * 10.0f); }
 
 // ============================================================================
 // RANGE SENSOR OUTPUT
 // ============================================================================
-
-bool SensorManager::isLidarFound(uint8_t idx) {
-    if (idx >= SENSOR_MAX_LIDARS) return false;
-    return lidarFound_[idx];
-}
 
 bool SensorManager::isUltrasonicFound(uint8_t idx) {
     if (idx >= SENSOR_MAX_ULTRASONICS) return false;
     return ultrasonicFound_[idx];
 }
 
-uint8_t SensorManager::getLidarConfiguredCount()      { return LIDAR_COUNT; }
 uint8_t SensorManager::getUltrasonicConfiguredCount() { return ULTRASONIC_COUNT; }
-
-uint16_t SensorManager::getLidarDistanceMm(uint8_t idx) {
-    if (idx >= SENSOR_MAX_LIDARS || !lidarFound_[idx]) return 0;
-    return lidarDistMm_[idx];
-}
 
 uint16_t SensorManager::getUltrasonicDistanceMm(uint8_t idx) {
     if (idx >= SENSOR_MAX_ULTRASONICS || !ultrasonicFound_[idx]) return 0;
     return ultrasonicDistMm_[idx];
+}
+
+void SensorManager::clearTimingPeaks() {
+    imuTimingPeakUs_ = 0;
+    ultrasonicTimingPeakUs_ = 0;
 }
 
 // ============================================================================

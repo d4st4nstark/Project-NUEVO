@@ -26,6 +26,7 @@ static const uint16_t kBudgets[LOOP_SLOT_COUNT] = {
 LoopMonitor::SlotData    LoopMonitor::slots_[LOOP_SLOT_COUNT] = {};
 LoopMonitor::RoundData   LoopMonitor::pidRound_               = {};
 volatile uint8_t         LoopMonitor::faultMask_              = 0;
+volatile uint8_t         LoopMonitor::liveFaultMask_          = 0;
 
 // ============================================================================
 // PUBLIC METHODS
@@ -50,6 +51,7 @@ void LoopMonitor::init()
     pidRound_.seeded = false;
 
     faultMask_ = 0;
+    liveFaultMask_ = 0;
 }
 
 bool LoopMonitor::record(LoopSlot slot, uint16_t us)
@@ -75,6 +77,7 @@ bool LoopMonitor::record(LoopSlot slot, uint16_t us)
     if (overrun) {
         if (s.faultCount < 0xFFFF) s.faultCount++;
         faultMask_ |= (uint8_t)(1u << slot);
+        liveFaultMask_ |= (uint8_t)(1u << slot);
     }
     return overrun;
 }
@@ -100,6 +103,7 @@ void LoopMonitor::recordPidRoundSpan(uint16_t spanUs, bool active)
     if (roundUs > pidRound_.budgetUs) {
         if (pidRound_.faultCount < 0xFFFF) pidRound_.faultCount++;
         faultMask_ |= LOOP_FAULT_PID_ROUND;
+        liveFaultMask_ |= LOOP_FAULT_PID_ROUND;
     }
 }
 
@@ -120,6 +124,7 @@ void LoopMonitor::clearPeaks()
         slots_[i].peakUs = 0;
     }
     pidRound_.peakUs = 0;
+    liveFaultMask_ = 0;
 }
 
 // ============================================================================
@@ -133,7 +138,7 @@ void LoopMonitor::report()
         F("PID_ISR    "),
         F("STEPPER_ISR"),
         F("MOTOR_TASK "),
-        F("SENSOR_ISR "),
+        F("SENSOR_TASK"),
         F("UART_TASK  "),
         F("USERIO     "),
     };

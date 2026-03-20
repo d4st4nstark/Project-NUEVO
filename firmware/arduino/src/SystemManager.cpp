@@ -4,20 +4,170 @@
  */
 
 #include "SystemManager.h"
+#include "modules/LoopMonitor.h"
+#include "modules/MessageCenter.h"
+#include "modules/SensorManager.h"
+#include "modules/UserIO.h"
 #include <avr/interrupt.h>
+
+namespace {
+
+void queueUserIoState(SystemState state)
+{
+    switch (state) {
+        case SYS_STATE_INIT:
+            UserIO::setPixelStateInit();
+            break;
+        case SYS_STATE_IDLE:
+            UserIO::setPixelStateIdle();
+            break;
+        case SYS_STATE_RUNNING:
+            UserIO::setPixelStateRunning();
+            break;
+        case SYS_STATE_ERROR:
+            UserIO::setPixelStateError();
+            break;
+        case SYS_STATE_ESTOP:
+            UserIO::setPixelStateEstop();
+            break;
+        default:
+            break;
+    }
+}
+
+} // namespace
 
 // ── Static member initialization ─────────────────────────────────────────────
 
 volatile SystemState SystemManager::state_ = SYS_STATE_INIT;
+bool SystemManager::batteryFaultArmed_ = false;
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
 void SystemManager::init() {
     state_ = SYS_STATE_INIT;
+    batteryFaultArmed_ = false;
 }
 
 SystemState SystemManager::getState() {
     return state_;   // uint8_t read — atomic on AVR, no guard needed
+}
+
+bool SystemManager::triggerBootCompleted() {
+    resetRunningPowerMonitor();
+    if (!requestTransition(SYS_STATE_IDLE)) {
+        return false;
+    }
+    queueUserIoState(SYS_STATE_IDLE);
+    return true;
+}
+
+bool SystemManager::triggerStartCommand() {
+    if (!requestTransition(SYS_STATE_RUNNING)) {
+        return false;
+    }
+
+    // RUNNING may start without a battery. Once a battery is seen during this
+    // session, loss of power becomes a hard safety fault.
+    batteryFaultArmed_ = SensorManager::isBatteryPresent();
+    queueUserIoState(SYS_STATE_RUNNING);
+    return true;
+}
+
+bool SystemManager::triggerStopCommand() {
+    if (!requestTransition(SYS_STATE_IDLE)) {
+        return false;
+    }
+
+    resetRunningPowerMonitor();
+    MessageCenter::disableAllActuators();
+    MessageCenter::cancelDeferredActions();
+    queueUserIoState(SYS_STATE_IDLE);
+    return true;
+}
+
+bool SystemManager::triggerResetCommand() {
+    if (!requestTransition(SYS_STATE_IDLE)) {
+        return false;
+    }
+
+    resetRunningPowerMonitor();
+    MessageCenter::disableAllActuators();
+    MessageCenter::cancelDeferredActions();
+    MessageCenter::clearFaultLatch();
+    LoopMonitor::clearFaults();
+    queueUserIoState(SYS_STATE_IDLE);
+    return true;
+}
+
+bool SystemManager::triggerEstopCommand() {
+    resetRunningPowerMonitor();
+    MessageCenter::disableAllActuators();
+    MessageCenter::cancelDeferredActions();
+    if (!requestTransition(SYS_STATE_ESTOP)) {
+        return false;
+    }
+    queueUserIoState(SYS_STATE_ESTOP);
+    return true;
+}
+
+void SystemManager::triggerSafetyFaultFromIsr(uint8_t triggerFlags) {
+    resetRunningPowerMonitor();
+    MessageCenter::disableAllActuators();
+    MessageCenter::latchFaultFlags(triggerFlags);
+    queueUserIoState(SYS_STATE_ERROR);
+    forceState(SYS_STATE_ERROR);
+}
+
+bool SystemManager::canEnableDriveActuator() {
+    SystemState st = getState();
+    return SensorManager::isBatteryPresent() &&
+           (st == SYS_STATE_IDLE || st == SYS_STATE_RUNNING);
+}
+
+bool SystemManager::canRunDriveActuator() {
+    return SensorManager::isBatteryPresent() &&
+           (getState() == SYS_STATE_RUNNING);
+}
+
+bool SystemManager::canEnableServoActuator() {
+    return SensorManager::isBatteryPresent() &&
+           (getState() == SYS_STATE_RUNNING);
+}
+
+bool SystemManager::shouldTripHeartbeatFault() {
+    return (getState() == SYS_STATE_RUNNING);
+}
+
+bool SystemManager::shouldTripBatteryFault() {
+    if (getState() != SYS_STATE_RUNNING) {
+        return false;
+    }
+
+    const bool batteryPresent = SensorManager::isBatteryPresent();
+    const bool batteryCritical = SensorManager::isBatteryCritical();
+    const bool batteryOvervoltage = SensorManager::isBatteryOvervoltage();
+
+    if (batteryPresent) {
+        batteryFaultArmed_ = true;
+    }
+
+    if (!batteryFaultArmed_) {
+        return false;
+    }
+
+    return (!batteryPresent) || batteryCritical || batteryOvervoltage;
+}
+
+uint8_t SystemManager::getBatteryFaultFlags() {
+    uint8_t flags = 0;
+    if (!SensorManager::isBatteryPresent() || SensorManager::isBatteryCritical()) {
+        flags |= ERR_UNDERVOLTAGE;
+    }
+    if (SensorManager::isBatteryOvervoltage()) {
+        flags |= ERR_OVERVOLTAGE;
+    }
+    return flags;
 }
 
 bool SystemManager::requestTransition(SystemState newState) {
@@ -66,4 +216,8 @@ void SystemManager::forceState(SystemState s) {
     // Called from an ISR — interrupts are already disabled by hardware.
     // Simple volatile write; no cli/sei guard needed.
     state_ = s;
+}
+
+void SystemManager::resetRunningPowerMonitor() {
+    batteryFaultArmed_ = false;
 }

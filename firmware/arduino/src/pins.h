@@ -152,8 +152,8 @@
 // STATUS AND USER LEDs
 // ============================================================================
 
-#define PIN_LED_RED             5       // Status LED Red (error/low battery) [Timer3 OC3A]
-#define PIN_LED_GREEN           44      // Status LED Green (system OK)
+#define PIN_LED_RED             5       // Discrete red LED (user-controlled) [Timer3 OC3A]
+#define PIN_LED_GREEN           44      // Discrete green LED (user-controlled)
 #define PIN_LED_BLUE            45      // User LED Blue (exposed)
 #define PIN_LED_ORANGE          46      // User LED Orange (exposed)
 #define PIN_LED_PURPLE          47      // User LED Purple (exposed, non-PWM)
@@ -162,7 +162,7 @@
 // NEOPIXEL (WS2812B RGB LED)
 // ============================================================================
 
-#define PIN_NEOPIXEL            42      // NeoPixel data line
+#define PIN_NEOPIXEL            42      // NeoPixel data line (automatic system-state indicator)
 
 // ============================================================================
 // USER GPIO (General Purpose — freed in Rev. B)

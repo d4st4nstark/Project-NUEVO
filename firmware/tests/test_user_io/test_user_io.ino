@@ -7,7 +7,7 @@
  * - LED control (5 LEDs: RED, GREEN, BLUE, ORANGE, PURPLE)
  * - LED modes (ON, OFF, BLINK, BREATHE, PWM)
  * - NeoPixel RGB LED (WS2812B)
- * - System status indication
+ * - NeoPixel color indication
  * - Debouncing and state tracking
  *
  * Hardware Requirements:
@@ -20,7 +20,7 @@
  * Expected Behavior:
  * - Buttons register presses with debouncing
  * - LEDs respond to mode commands
- * - NeoPixel shows system status colors
+ * - NeoPixel shows the requested demo colors
  * - Blink and breathe modes animate smoothly
  * - No false triggers or bouncing
  *
@@ -33,8 +33,8 @@
  *   NeoPixel:
  *   n<0-7>       - Set NeoPixel (0=off, 1=red, 2=green, 3=blue, 4=yellow, 5=cyan, 6=magenta, 7=white)
  *
- *   Status:
- *   s<0-3>       - Set system status (0=OK, 1=BUSY, 2=WARNING, 3=ERROR)
+ *   Status Colors:
+ *   s<0-3>       - Set NeoPixel demo color (0=GREEN, 1=CYAN, 2=YELLOW, 3=RED)
  *   ?            - Print button/LED status
  *   h            - Show help
  *
@@ -59,6 +59,16 @@ const uint32_t STATUS_PERIOD_MS = 2000;  // Print status every 2 seconds
 bool btnWasPressed[10] = {false};
 uint8_t neoPixelColorIndex = 0;
 
+static void setDemoNeoPixelColor(uint8_t colorIndex) {
+    switch (colorIndex) {
+        case 0: UserIO::setNeoPixelColor(0, 90, 25); break;    // green
+        case 1: UserIO::setNeoPixelColor(0, 120, 140); break;  // cyan
+        case 2: UserIO::setNeoPixelColor(255, 180, 0); break;  // yellow
+        case 3: UserIO::setNeoPixelColor(255, 0, 0); break;    // red
+        default: UserIO::setNeoPixelColor(0, 0, 0); break;
+    }
+}
+
 // ============================================================================
 // SETUP
 // ============================================================================
@@ -80,8 +90,8 @@ void setup() {
     // Initialize UserIO
     Serial.println(F("[Setup] Initializing User I/O..."));
     UserIO::init();
-    // Disable SystemManager-driven NeoPixel animation — this test uses manual
-    // color control via setSystemStatus() / setNeoPixelColor() / commands.
+    // Disable SystemManager-driven NeoPixel rendering — this test uses manual
+    // color control via setNeoPixelColor() / commands.
     UserIO::setNeoAutoAnimate(false);
     Serial.println(F("  - Buttons initialized"));
     Serial.println(F("  - LEDs initialized"));
@@ -120,21 +130,21 @@ void setup() {
     delay(500);
     UserIO::setLED(LED_PURPLE, LED_OFF, 0, 0);
 
-    // Test NeoPixel colors (setSystemStatus calls show() internally)
+    // Test NeoPixel colors
     Serial.println(F("  - NeoPixel RED"));
-    UserIO::setSystemStatus(STATUS_ERROR);
+    UserIO::setNeoPixelColor(255, 0, 0);
     delay(500);
 
     Serial.println(F("  - NeoPixel GREEN"));
-    UserIO::setSystemStatus(STATUS_OK);
+    UserIO::setNeoPixelColor(0, 90, 25);
     delay(500);
 
     Serial.println(F("  - NeoPixel BLUE"));
-    UserIO::setSystemStatus(STATUS_BUSY);
+    UserIO::setNeoPixelColor(0, 0, 255);
     delay(500);
 
     Serial.println(F("  - NeoPixel YELLOW"));
-    UserIO::setSystemStatus(STATUS_WARNING);
+    UserIO::setNeoPixelColor(255, 180, 0);
     delay(500);
 
     Serial.println(F("  - NeoPixel OFF"));
@@ -223,10 +233,9 @@ void handleButtons() {
         }
     }
 
-    // BTN6-9: Cycle NeoPixel status colors
+    // BTN6-9: Cycle NeoPixel demo colors
     for (uint8_t i = 5; i < 9; i++) {
         if (btnPressed[i] && !btnWasPressed[i]) {
-            const uint32_t statusColors[] = {STATUS_OK, STATUS_BUSY, STATUS_WARNING, STATUS_ERROR};
             const char* colorNames[] = {"GREEN (OK)", "CYAN (BUSY)", "YELLOW (WARNING)", "RED (ERROR)"};
 
             neoPixelColorIndex = (neoPixelColorIndex + 1) % 4;
@@ -236,7 +245,7 @@ void handleButtons() {
             Serial.print(F("] Pressed - NeoPixel: "));
             Serial.println(colorNames[neoPixelColorIndex]);
 
-            UserIO::setSystemStatus(statusColors[neoPixelColorIndex]);
+            setDemoNeoPixelColor(neoPixelColorIndex);
         }
     }
 
@@ -298,15 +307,14 @@ void processSerialCommands() {
             Serial.println(F("ERROR: Format n<0-7>"));
         }
     }
-    // System status command
+    // NeoPixel demo color command
     else if (cmdChar1 == 's' || cmdChar1 == 'S') {
         if (cmdChar2 >= '0' && cmdChar2 <= '3') {
             uint8_t statusIdx = cmdChar2 - '0';
-            const uint32_t statusColors[] = {STATUS_OK, STATUS_BUSY, STATUS_WARNING, STATUS_ERROR};
-            const char* statusNames[] = {"OK", "BUSY", "WARNING", "ERROR"};
-            Serial.print(F(">>> System status: "));
+            const char* statusNames[] = {"GREEN", "CYAN", "YELLOW", "RED"};
+            Serial.print(F(">>> NeoPixel color: "));
             Serial.println(statusNames[statusIdx]);
-            UserIO::setSystemStatus(statusColors[statusIdx]);
+            setDemoNeoPixelColor(statusIdx);
         } else {
             Serial.println(F("ERROR: Format s<0-3>"));
         }

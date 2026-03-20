@@ -158,3 +158,12 @@ bool StepperManager::anyMoving() {
     }
     return false;
 }
+
+bool StepperManager::anyEnabled() {
+    for (uint8_t i = 0; i < NUM_STEPPERS; i++) {
+        if (steppers_[i].isEnabled()) {
+            return true;
+        }
+    }
+    return false;
+}

@@ -19,7 +19,7 @@
  *   imu.init(IMU_AD0_VAL);          // AD0_VAL: 0=0x68, 1=0x69
  *
  *   if (imu.dataReady()) {
- *       imu.update();               // reads getAGMT() from hardware
+ *       imu.update();               // reads the contiguous AGT(+mag) register block
  *       float ax = imu.getAccX();   // mg
  *       float gx = imu.getGyrX();   // DPS
  *       float mx = imu.getMagX();   // µT (offset applied)
@@ -65,13 +65,16 @@ public:
     bool dataReady();
 
     /**
-     * @brief Read all sensor data from ICM-20948 (calls getAGMT internally)
+     * @brief Read the current sensor sample from the ICM-20948
      *
      * Must call dataReady() first; call this when it returns true.
+     * When includeMag is true, this performs one direct burst read of the
+     * accel/gyro/temp registers plus the embedded AK09916 external-sensor
+     * window populated by the ICM-20948 internal I2C master.
      *
      * @return True if read was successful
      */
-    bool update();
+    bool update(bool includeMag = true);
 
     // ========================================================================
     // SCALED OUTPUTS (post-library conversion, float)

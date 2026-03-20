@@ -5,8 +5,8 @@
  * This module manages all user-facing I/O:
  * - 10 user buttons (active low with internal pullup)
  * - 8 limit switches (shared pins with buttons 3-10)
- * - Status LEDs (red, green) and user LEDs (blue, orange, purple)
- * - NeoPixel RGB LED for system status indication
+ * - 5 discrete user/TLV-controlled LEDs
+ * - 1 NeoPixel RGB LED for automatic system state indication
  *
  * LED Modes:
  * - OFF: LED is off
@@ -15,15 +15,18 @@
  * - BLINK: LED blinks at specified period
  * - BREATHE: LED fades in and out (breathing effect)
  *
- * NeoPixel System Status Colors:
- * - GREEN: System OK, ready
- * - BLUE: Idle, waiting for commands
- * - CYAN: Busy, processing
- * - YELLOW: Warning (low battery, sensor fault)
- * - RED: Error (communication timeout, critical fault)
+ * NeoPixel System State Colors:
+ * - INIT: yellow
+ * - IDLE: green
+ * - RUNNING: cyan
+ * - ERROR: red
+ * - ESTOP: red-magenta
  *
  * Usage:
  *   UserIO::init();
+ *
+ *   // In scheduler task @ 100Hz:
+ *   UserIO::sampleInputs();
  *
  *   // In scheduler task @ 20Hz:
  *   UserIO::update();
@@ -34,8 +37,8 @@
  *   // Set LED:
  *   UserIO::setLED(LED_RED, LED_MODE_BLINK, 255, 500);
  *
- *   // Set status:
- *   UserIO::setSystemStatus(STATUS_OK);
+ *   // Queue the NeoPixel for a state entry:
+ *   UserIO::setPixelStateRunning();
  */
 
 #ifndef USERIO_H
@@ -55,8 +58,8 @@
 // ============================================================================
 
 enum LEDId {
-    LED_RED = 0,        // Status LED red (error/low battery)
-    LED_GREEN = 1,      // Status LED green (system OK)
+    LED_RED = 0,        // Discrete red LED (user-controlled)
+    LED_GREEN = 1,      // Discrete green LED (user-controlled)
     LED_BLUE = 2,       // User LED blue
     LED_ORANGE = 3,     // User LED orange
     LED_PURPLE = 4,     // User LED purple (non-PWM)
@@ -73,7 +76,7 @@ enum LEDId {
  * Static class providing:
  * - Button and limit switch reading
  * - LED control with multiple modes
- * - NeoPixel system status indication
+ * - NeoPixel system state indication
  */
 class UserIO {
 public:
@@ -86,23 +89,47 @@ public:
     static void init();
 
     /**
-     * @brief Update LED animations and button states
+     * @brief Update LED animations and NeoPixel state
      *
      * Called from scheduler at 20Hz.
-     * Updates LED patterns (blink, breathe) and reads button states.
+     * Updates LED patterns (blink, breathe) and NeoPixel animation only.
      */
     static void update();
+
+    /**
+     * @brief Sample user buttons and shared limit-switch GPIOs.
+     *
+     * Called from the 100 Hz soft sensor task so button and limit state caches
+     * are refreshed together on the same cadence.
+     */
+    static void sampleInputs();
+
+    /**
+     * @brief Service the periodic user-I/O task.
+     *
+     * Runs LED animations and queued NeoPixel state rendering.
+     */
+    static void serviceTask();
+
+    /**
+     * @brief Re-apply the current LED hardware state after timer setup.
+     *
+     * Timer1/Timer3 configuration can reconnect OC output channels after
+     * UserIO::init() has already driven LEDs low. Call this once after the
+     * real-time timers are configured so the logical LED state matches the
+     * actual hardware output at startup.
+     */
+    static void syncOutputs();
 
     // ========================================================================
     // BUTTON INTERFACE
     // ========================================================================
 
     /**
-     * @brief Read all button GPIO states — ISR-safe (no millis/delay)
+     * @brief Read all button GPIO states
      *
      * Updates volatile buttonStates_ and prevButtonStates_.
-     * Call from TIMER1_OVF_vect at 100 Hz for responsive button detection.
-     * Replaces the old updateButtons() call that was inside update().
+     * Kept as a narrow helper used by sampleInputs().
      */
     static void readButtons();
 
@@ -194,17 +221,35 @@ public:
     static uint8_t getLEDBrightness(uint8_t ledId);
 
     // ========================================================================
-    // NEOPIXEL SYSTEM STATUS
+    // NEOPIXEL SYSTEM STATE
     // ========================================================================
 
     /**
-     * @brief Set system status color on NeoPixel
+     * @brief Queue the INIT-state NeoPixel presentation.
      *
-     * Sets the NeoPixel to a predefined status color.
-     *
-     * @param status Status color (STATUS_OK, STATUS_WARNING, STATUS_ERROR, etc.)
+     * Safe to call from any context. Rendering happens later from update().
      */
-    static void setSystemStatus(uint32_t status);
+    static void setPixelStateInit();
+
+    /**
+     * @brief Queue the IDLE-state NeoPixel presentation.
+     */
+    static void setPixelStateIdle();
+
+    /**
+     * @brief Queue the RUNNING-state NeoPixel presentation.
+     */
+    static void setPixelStateRunning();
+
+    /**
+     * @brief Queue the ERROR-state NeoPixel presentation.
+     */
+    static void setPixelStateError();
+
+    /**
+     * @brief Queue the ESTOP-state NeoPixel presentation.
+     */
+    static void setPixelStateEstop();
 
     /**
      * @brief Set custom NeoPixel color
@@ -230,10 +275,10 @@ public:
     static void setNeoPixelBrightness(uint8_t brightness);
 
     /**
-     * @brief Enable or disable the automatic SystemManager-driven NeoPixel animation
+     * @brief Enable or disable the automatic state-driven NeoPixel rendering.
      *
-     * When enabled (default), update() drives the NeoPixel based on SystemManager::getState().
-     * When disabled, setSystemStatus() / setNeoPixelColor() calls stick until changed.
+     * When enabled (default), update() renders the latest queued system state.
+     * When disabled, manual setNeoPixelColor() calls stick until changed.
      *
      * Disable in test sketches or wherever manual NeoPixel control is needed.
      *
@@ -257,7 +302,7 @@ private:
     };
     static LEDState leds_[LED_COUNT];
 
-    // Button state tracking (volatile — written by ISR via readButtons(), read by soft task)
+    // Button state tracking (updated by sampleInputs(), read by soft tasks)
     static volatile uint16_t buttonStates_;
     static volatile uint16_t prevButtonStates_;
 
@@ -265,9 +310,10 @@ private:
     static uint8_t limitStates_;
 
     // NeoPixel animation state machine
-    static uint8_t     animPhase_;       // Animation frame counter (0-255, wraps)
-    static SystemState lastAnimState_;   // Detected state change → resets animPhase_
-    static bool        neoAutoAnimate_;  // true = SystemManager-driven, false = manual
+    static uint8_t              animPhase_;       // Reserved for future state animations
+    static volatile SystemState pixelState_;      // Latest queued system state
+    static volatile bool        pixelStateDirty_; // True when update() should re-render state
+    static bool                 neoAutoAnimate_;  // true = state-driven, false = manual
 
     // Initialization flag
     static bool initialized_;
@@ -282,16 +328,21 @@ private:
     static void updateLEDs();
 
     /**
-     * @brief Update NeoPixel animation based on SystemManager::getState()
+     * @brief Update NeoPixel rendering for the queued system state.
      *
-     * Called from update() at 20 Hz. Drives state-based animations:
-     *   INIT    — static yellow
-     *   IDLE    — slow breathing emerald (~3 s period)
-     *   RUNNING — rainbow hue sweep (~3.2 s full cycle)
-     *   ERROR   — fast flashing red with slight hue shift (0.5 s period)
-     *   ESTOP   — solid bright red
+     * Called from update() at 20 Hz. State changes are queued by SystemManager;
+     * this task performs the actual NeoPixel write so the state transition path
+     * itself does not call show().
      */
     static void updateNeoPixelAnimation();
+
+    /**
+     * @brief Queue a new system-state presentation for the NeoPixel.
+     *
+     * This is the shared implementation behind the public setPixelState*()
+     * entry points. It only updates cached state; rendering happens in update().
+     */
+    static void queuePixelState(SystemState state);
 
     /**
      * @brief Convert HSV to RGB (fast integer implementation, /256 approximation)
@@ -302,11 +353,6 @@ private:
      */
     static void hsvToRgb(uint8_t h, uint8_t s, uint8_t v,
                          uint8_t& r, uint8_t& g, uint8_t& b);
-
-    /**
-     * @brief Update limit switch states
-     */
-    static void updateLimitSwitches();
 
     /**
      * @brief Update single LED based on mode

@@ -7,6 +7,40 @@
 
 #include "IMUDriver.h"
 
+#if IMU_ENABLED
+#include "../lib/SparkFun_9DoF_IMU_Breakout_-_ICM_20948_-_Arduino_Library/src/util/ICM_20948_REGISTERS.h"
+#endif
+
+namespace {
+
+int16_t readBe16(const uint8_t *buf) {
+    return (int16_t)((((uint16_t)buf[0]) << 8) | (uint16_t)buf[1]);
+}
+
+int16_t readLe16(const uint8_t *buf) {
+    return (int16_t)((((uint16_t)buf[1]) << 8) | (uint16_t)buf[0]);
+}
+
+float rawAccelToMg(int16_t raw) {
+    // startupDefault() configures the ICM-20948 to ±2 g accel range.
+    return ((float)raw) / 16.384f;
+}
+
+float rawGyroToDps(int16_t raw) {
+    // startupDefault() configures the ICM-20948 to ±250 dps gyro range.
+    return ((float)raw) / 131.0f;
+}
+
+float rawTempToC(int16_t raw) {
+    return ((((float)raw) - 21.0f) / 333.87f) + 21.0f;
+}
+
+float rawMagToUt(int16_t raw) {
+    return ((float)raw) * 0.15f;
+}
+
+} // namespace
+
 // ============================================================================
 // CONSTRUCTOR
 // ============================================================================
@@ -27,9 +61,9 @@ IMUDriver::IMUDriver()
 
 bool IMUDriver::init(uint8_t ad0Val) {
 #if IMU_ENABLED
-    // Wire.begin() is called once globally in main setup; do not call here.
-    // Set I2C clock to 400 kHz for fast sensor reads.
-    Wire.setClock(400000);
+    // The shared I2C bus is configured once by SensorManager::init().
+    // Do not change the global bus speed here; the same Wire bus is also used
+    // by the ultrasonic sensors and PCA9685 servo controller.
 
     // Try to initialize the ICM-20948. The library will retry on failure.
     imu_.begin(Wire, ad0Val);
@@ -72,33 +106,54 @@ bool IMUDriver::dataReady() {
 #endif
 }
 
-bool IMUDriver::update() {
+bool IMUDriver::update(bool includeMag) {
 #if IMU_ENABLED
     if (!initialized_) return false;
 
-    // Read all axes in a single I2C transaction (accel + gyro + mag + temp)
-    imu_.getAGMT();
+    // Direct register bursts must start from bank 0. The previous dataReady()
+    // call happened to leave the device there; once that extra I2C poll was
+    // removed, we need to select the bank explicitly again.
+    if (imu_.setBank(0) != ICM_20948_Stat_Ok) {
+        return false;
+    }
 
-    // Accelerometer: accX() returns mg (milligravity)
-    accX_ = imu_.accX();
-    accY_ = imu_.accY();
-    accZ_ = imu_.accZ();
+    const uint8_t rawLen = includeMag ? 23U : 14U;
+    uint8_t raw[23] = {};
+    if (imu_.read(AGB0_REG_ACCEL_XOUT_H, raw, rawLen) != ICM_20948_Stat_Ok) {
+        return false;
+    }
 
-    // Gyroscope: gyrX() returns DPS (degrees per second)
-    gyrX_ = imu_.gyrX();
-    gyrY_ = imu_.gyrY();
-    gyrZ_ = imu_.gyrZ();
+    accX_ = rawAccelToMg(readBe16(&raw[0]));
+    accY_ = rawAccelToMg(readBe16(&raw[2]));
+    accZ_ = rawAccelToMg(readBe16(&raw[4]));
 
-    // Magnetometer: magX() returns µT; subtract hard-iron calibration offsets
-    magX_ = imu_.magX() - magOffX_;
-    magY_ = imu_.magY() - magOffY_;
-    magZ_ = imu_.magZ() - magOffZ_;
+    gyrX_ = rawGyroToDps(readBe16(&raw[6]));
+    gyrY_ = rawGyroToDps(readBe16(&raw[8]));
+    gyrZ_ = rawGyroToDps(readBe16(&raw[10]));
 
-    // Temperature: temp() returns °C
-    temp_ = imu_.temp();
+    temp_ = rawTempToC(readBe16(&raw[12]));
+
+    if (includeMag) {
+        // startupDefault() configures the embedded AK09916 for continuous
+        // 100 Hz sampling and maps ST1 + XYZ + ST2 into the external sensor
+        // data registers right after TEMP_OUT. Reading the whole 23-byte block
+        // directly is much cheaper than the library's getAGMT() helper, which
+        // also re-reads scale configuration on every sample.
+        const uint8_t magStatus1 = raw[14];
+        const uint8_t magStatus2 = raw[22];
+        const bool magReady = (magStatus1 & 0x01U) != 0U;
+        const bool magOverflow = (magStatus2 & 0x08U) != 0U;
+
+        if (magReady && !magOverflow) {
+            magX_ = rawMagToUt(readLe16(&raw[15])) - magOffX_;
+            magY_ = rawMagToUt(readLe16(&raw[17])) - magOffY_;
+            magZ_ = rawMagToUt(readLe16(&raw[19])) - magOffZ_;
+        }
+    }
 
     return true;
 #else
+    (void)includeMag;
     return false;
 #endif
 }

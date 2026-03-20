@@ -6,21 +6,33 @@
 #include <string.h>
 
 DebugLogPort DEBUG_LOG;
+HardwareSerial &DEBUG_SERIAL_PORT = Serial;
+Print &DEBUG_SERIAL = DEBUG_LOG;
 
 char DebugLog::buffer_[DEBUG_LOG_BUFFER_SIZE];
 uint16_t DebugLog::head_ = 0;
 uint16_t DebugLog::tail_ = 0;
 uint16_t DebugLog::droppedBytes_ = 0;
 bool DebugLog::initialized_ = false;
+bool DebugLog::passthrough_ = false;
 
 size_t DebugLogPort::write(uint8_t c)
 {
+    if (DebugLog::passthrough_) {
+        return DEBUG_SERIAL_PORT.write(c);
+    }
     return DebugLog::pushChar((char)c) ? 1U : 0U;
 }
 
 size_t DebugLogPort::write(const uint8_t *buffer, size_t size)
 {
-    if (!DebugLog::initialized_ || buffer == nullptr) {
+    if (buffer == nullptr) {
+        return 0;
+    }
+    if (DebugLog::passthrough_) {
+        return DEBUG_SERIAL_PORT.write(buffer, size);
+    }
+    if (!DebugLog::initialized_) {
         return 0;
     }
 
@@ -40,6 +52,12 @@ void DebugLog::init()
     tail_ = 0;
     droppedBytes_ = 0;
     initialized_ = true;
+    passthrough_ = false;
+}
+
+void DebugLog::setPassthrough(bool enabled)
+{
+    passthrough_ = enabled;
 }
 
 bool DebugLog::pushChar(char c)
@@ -123,9 +141,9 @@ void DebugLog::flush()
         return;
     }
 
-    int space = DEBUG_SERIAL.availableForWrite();
+    int space = DEBUG_SERIAL_PORT.availableForWrite();
     while (space > 0 && tail_ != head_) {
-        DEBUG_SERIAL.write((uint8_t)buffer_[tail_]);
+        DEBUG_SERIAL_PORT.write((uint8_t)buffer_[tail_]);
         tail_ = (uint16_t)((tail_ + 1U) % DEBUG_LOG_BUFFER_SIZE);
         space--;
     }
