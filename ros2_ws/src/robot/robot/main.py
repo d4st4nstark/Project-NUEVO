@@ -24,7 +24,17 @@ from robot.path_planner import PurePursuitPlanner
 # Drive-wheel mapping for this robot build.
 # Change these if the left/right wheels are wired to different DC motor ports.
 LEFT_WHEEL_MOTOR = Motor.DC_M1
+LEFT_WHEEL_DIR_INVERTED = False
 RIGHT_WHEEL_MOTOR = Motor.DC_M2
+RIGHT_WHEEL_DIR_INVERTED = True
+
+# Odometry / diff-drive geometry for this robot build.
+# The path planner assumes pose is reported in millimetres and heading in radians.
+# Set these once at startup so firmware odometry and robot-side body-motion
+# mixing agree on the same wheel geometry and motor mapping.
+WHEEL_DIAMETER_MM = 74.0
+WHEEL_BASE_MM = 333.0
+INITIAL_THETA_DEG = 90.0
 
 
 class MyFSM(RobotFSM):
@@ -209,7 +219,14 @@ class MyFSM(RobotFSM):
 
 
 def run(robot: Robot) -> None:
-    robot.set_left_wheel(LEFT_WHEEL_MOTOR)
-    robot.set_right_wheel(RIGHT_WHEEL_MOTOR)
+    robot.set_odometry_parameters(
+        wheel_diameter_mm=WHEEL_DIAMETER_MM,
+        wheel_base_mm=WHEEL_BASE_MM,
+        initial_theta_deg=INITIAL_THETA_DEG,
+        left_motor_id=LEFT_WHEEL_MOTOR,
+        left_motor_dir_inverted=LEFT_WHEEL_DIR_INVERTED,
+        right_motor_id=RIGHT_WHEEL_MOTOR,
+        right_motor_dir_inverted=RIGHT_WHEEL_DIR_INVERTED,
+    )
     fsm = MyFSM(robot)
     fsm.spin(hz=DEFAULT_FSM_HZ)
