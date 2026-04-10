@@ -29,6 +29,9 @@ rover_ids : int[]  (default [11-18])
 
 from __future__ import annotations
 
+import json
+import socket
+import threading
 import numpy as np
 import cv2
 
@@ -74,10 +77,12 @@ class GroundLocalizer(Node):
         self.declare_parameter("marker_size", 0.10)
         self.declare_parameter("corner_ids", [0, 1, 2, 3])
         self.declare_parameter("rover_ids", [11, 12, 13, 14, 15, 16, 17, 18])
+        self.declare_parameter("tcp_port", 7777)
 
         self._marker_size: float = float(self.get_parameter("marker_size").value)
         self._corner_ids: list[int] = list(self.get_parameter("corner_ids").value)
         self._rover_ids: list[int] = list(self.get_parameter("rover_ids").value)
+        self._tcp_port: int = int(self.get_parameter("tcp_port").value)
 
         self._obj_pts = _MARKER_OBJ_PTS_UNIT * self._marker_size
 
@@ -101,6 +106,21 @@ class GroundLocalizer(Node):
         self._ground_plane: dict | None = None    # {"normal": ..., "d": ...}
         self._T_world_from_cam: np.ndarray | None = None
         self._calibrated: bool = False
+
+        # ── TCP push server (NAT-friendly: robots connect to us) ──────────
+        # Robots on WiFi cannot be reached from the wired Jetson because the
+        # WiFi AP performs NAT.  Instead, each robot's robot_gps node opens a
+        # TCP connection to this server.  We push line-delimited JSON
+        # detections over the established connection.
+        self._tcp_clients: list[socket.socket] = []
+        self._tcp_lock = threading.Lock()
+        self._tcp_server_thread = threading.Thread(
+            target=self._tcp_server_loop, daemon=True
+        )
+        self._tcp_server_thread.start()
+        self.get_logger().info(
+            f"TCP push server listening on port {self._tcp_port}"
+        )
 
         # ── Publishers ────────────────────────────────────────────────────
         self._detections_pub = self.create_publisher(
@@ -257,6 +277,12 @@ class GroundLocalizer(Node):
         msg.header = rgb_msg.header
         msg.detections = detections
         self._detections_pub.publish(msg)
+
+        stamp_sec = (
+            rgb_msg.header.stamp.sec + rgb_msg.header.stamp.nanosec * 1e-9
+        )
+        self._tcp_push(detections, stamp_sec)
+
         self.get_logger().info(
             f"Published {len(detections)} rover tag(s): "
             f"{[d.tag_id for d in detections]}"
@@ -299,6 +325,51 @@ class GroundLocalizer(Node):
 
         theta = float(np.arctan2(marker_x_world[1], marker_x_world[0]))
         return float(p_world[0]), float(p_world[1]), theta
+
+
+    # ── TCP server ────────────────────────────────────────────────────────
+
+    def _tcp_server_loop(self) -> None:
+        """Accept robot connections in a background thread."""
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", self._tcp_port))
+        srv.listen(16)
+        srv.settimeout(1.0)
+        while rclpy.ok():
+            try:
+                conn, addr = srv.accept()
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                with self._tcp_lock:
+                    self._tcp_clients.append(conn)
+                self.get_logger().info(f"Robot connected from {addr}")
+            except socket.timeout:
+                continue
+            except Exception as exc:
+                self.get_logger().warn(f"TCP server error: {exc}")
+        srv.close()
+
+    def _tcp_push(self, detections: list[TagDetection], stamp_sec: float) -> None:
+        """Serialize detections to JSON and push to all connected robots."""
+        payload = json.dumps({
+            "stamp": stamp_sec,
+            "detections": [
+                {"tag_id": d.tag_id, "x": d.x, "y": d.y, "theta": d.theta}
+                for d in detections
+            ],
+        }) + "\n"
+        data = payload.encode()
+        dead: list[socket.socket] = []
+        with self._tcp_lock:
+            for conn in self._tcp_clients:
+                try:
+                    conn.sendall(data)
+                except OSError:
+                    dead.append(conn)
+            for conn in dead:
+                self._tcp_clients.remove(conn)
+                conn.close()
+                self.get_logger().info("Robot disconnected")
 
 
 def main() -> None:

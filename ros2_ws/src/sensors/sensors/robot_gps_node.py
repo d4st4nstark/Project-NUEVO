@@ -1,23 +1,22 @@
 """
 Robot GPS node.
 
-Bridges global ArUco localizer detections from the Jetson Nano into the
-robot's local ROS2 domain.
+Receives global ArUco localizer detections from the Jetson Nano over a TCP
+connection and re-publishes them on /tag_detections in the local ROS2 domain.
 
-The Jetson publishes on /global_gps/tag_detections across the full network
-(ROS_LOCALHOST_ONLY=0).  The rest of the robot stack runs with
-ROS_LOCALHOST_ONLY=1 and cannot see that topic.  This node runs with
-ROS_LOCALHOST_ONLY=0, receives the Jetson's detections, and re-publishes
-them on /tag_detections so that localhost-only nodes (the robot node, etc.)
-can subscribe normally.
+Why TCP instead of ROS2 DDS:
+    The lab WiFi access point performs NAT for WiFi clients (robots).  The
+    Jetson (wired Ethernet) cannot initiate connections back to a WiFi client.
+    By having the robot *connect to* the Jetson's TCP server (port 7777),
+    the NAT table is established by the outbound connection and the Jetson
+    can push data back over the same socket.  No network-admin changes needed.
 
-IMPORTANT — startup:
-    This node must be launched with ROS_LOCALHOST_ONLY=0 explicitly,
-    separate from the main bridge/robot stack.  See the sensors package
-    README or ros2_ws/README.md for the exact command.
-
-Topic subscribed  (global network):
-    /global_gps/tag_detections  (bridge_interfaces/msg/TagDetectionArray)
+Parameters
+----------
+jetson_ip  : str  (default "192.168.8.120")
+    IP address of the Jetson running the global_gps stack.
+jetson_port : int  (default 7777)
+    TCP port of the Jetson's detection push server.
 
 Topic published  (visible locally on this machine):
     /tag_detections  (bridge_interfaces/msg/TagDetectionArray)
@@ -25,11 +24,19 @@ Topic published  (visible locally on this machine):
 
 from __future__ import annotations
 
+import json
+import socket
+import threading
+import time
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
-from bridge_interfaces.msg import TagDetectionArray
+from std_msgs.msg import Header
+from builtin_interfaces.msg import Time
+
+from bridge_interfaces.msg import TagDetection, TagDetectionArray
 
 
 _RELIABLE_QOS = QoSProfile(
@@ -38,12 +45,20 @@ _RELIABLE_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
 )
 
+_RECONNECT_DELAY = 3.0  # seconds between reconnect attempts
+
 
 class RobotGpsNode(Node):
-    """Re-publishes global GPS detections into the local ROS domain."""
+    """Receive global GPS detections from Jetson via TCP and republish locally."""
 
     def __init__(self) -> None:
         super().__init__("robot_gps")
+
+        self.declare_parameter("jetson_ip", "192.168.8.120")
+        self.declare_parameter("jetson_port", 7777)
+
+        self._jetson_ip: str = self.get_parameter("jetson_ip").value
+        self._jetson_port: int = int(self.get_parameter("jetson_port").value)
 
         self._pub = self.create_publisher(
             TagDetectionArray,
@@ -51,19 +66,78 @@ class RobotGpsNode(Node):
             _RELIABLE_QOS,
         )
 
-        self.create_subscription(
-            TagDetectionArray,
-            "/global_gps/tag_detections",
-            self._on_detections,
-            _RELIABLE_QOS,
-        )
-
         self.get_logger().info(
-            "Robot GPS node started. "
-            "Bridging /global_gps/tag_detections → /tag_detections"
+            f"Robot GPS node started. "
+            f"Connecting to Jetson at {self._jetson_ip}:{self._jetson_port}"
         )
 
-    def _on_detections(self, msg: TagDetectionArray) -> None:
+        self._recv_thread = threading.Thread(
+            target=self._recv_loop, daemon=True
+        )
+        self._recv_thread.start()
+
+    # ── TCP receive loop ──────────────────────────────────────────────────
+
+    def _recv_loop(self) -> None:
+        """Connect to Jetson TCP server and receive line-delimited JSON."""
+        while rclpy.ok():
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5.0)
+                sock.connect((self._jetson_ip, self._jetson_port))
+                self.get_logger().info(
+                    f"Connected to Jetson at "
+                    f"{self._jetson_ip}:{self._jetson_port}"
+                )
+                buf = b""
+                while rclpy.ok():
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        self._handle_line(line.decode("utf-8", errors="ignore"))
+            except (OSError, ConnectionRefusedError) as exc:
+                self.get_logger().warn(
+                    f"Jetson connection lost ({exc}). "
+                    f"Retrying in {_RECONNECT_DELAY:.0f}s…"
+                )
+            finally:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            time.sleep(_RECONNECT_DELAY)
+
+    def _handle_line(self, line: str) -> None:
+        """Parse one JSON detection line and publish to /tag_detections."""
+        line = line.strip()
+        if not line:
+            return
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            self.get_logger().warn(f"Bad JSON from Jetson: {line[:80]}")
+            return
+
+        stamp_sec = float(data.get("stamp", 0.0))
+        sec = int(stamp_sec)
+        nanosec = int((stamp_sec - sec) * 1e9)
+
+        msg = TagDetectionArray()
+        msg.header = Header()
+        msg.header.stamp = Time(sec=sec, nanosec=nanosec)
+        msg.header.frame_id = "world"
+
+        for det in data.get("detections", []):
+            d = TagDetection()
+            d.tag_id = int(det["tag_id"])
+            d.x = float(det["x"])
+            d.y = float(det["y"])
+            d.theta = float(det["theta"])
+            msg.detections.append(d)
+
         self._pub.publish(msg)
         self.get_logger().debug(
             f"Forwarded {len(msg.detections)} detection(s): "

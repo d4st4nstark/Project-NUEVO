@@ -35,6 +35,11 @@ def generate_launch_description() -> LaunchDescription:
         default_value="[11, 12, 13, 14, 15, 16, 17, 18]",
         description="Marker IDs that appear on rovers.",
     )
+    tcp_port_arg = DeclareLaunchArgument(
+        "tcp_port",
+        default_value="7777",
+        description="TCP port for the robot push server (NAT-friendly delivery).",
+    )
 
     # ── RealSense camera driver ───────────────────────────────────────────
     realsense_launch = IncludeLaunchDescription(
@@ -65,6 +70,7 @@ def generate_launch_description() -> LaunchDescription:
             "marker_size": LaunchConfiguration("marker_size"),
             "corner_ids": LaunchConfiguration("corner_ids"),
             "rover_ids": LaunchConfiguration("rover_ids"),
+            "tcp_port": LaunchConfiguration("tcp_port"),
         }],
     )
 
@@ -72,6 +78,7 @@ def generate_launch_description() -> LaunchDescription:
         marker_size_arg,
         corner_ids_arg,
         rover_ids_arg,
+        tcp_port_arg,
         realsense_launch,
         localizer_node,
     ])
