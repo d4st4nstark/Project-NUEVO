@@ -8,7 +8,6 @@
 .vscode/
 .local/
 openspec/
-build/
 CLAUDE.md
 
 # ============================================

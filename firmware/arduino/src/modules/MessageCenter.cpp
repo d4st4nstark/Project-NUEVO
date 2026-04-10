@@ -33,6 +33,8 @@
 extern DCMotor dcMotors[NUM_DC_MOTORS];
 
 namespace {
+constexpr uint16_t kTxDrainBudgetUs = 120U;
+
 void getOdomMotorTicks(int32_t &leftTicks, int32_t &rightTicks)
 {
     const uint8_t leftMotorId = RobotKinematics::getLeftMotorId();
@@ -97,13 +99,15 @@ static void logRawRxBurst(const uint8_t *bytes, uint8_t count)
 struct TlvEncodeDescriptor MessageCenter::encodeDesc_;
 struct TlvDecodeDescriptor MessageCenter::decodeDesc_;
 
-uint8_t MessageCenter::txStorage_[TX_BUFFER_SIZE];
+uint8_t MessageCenter::txStorage_[TX_QUEUE_DEPTH][TX_BUFFER_SIZE];
 uint8_t MessageCenter::rxStorage_[RX_BUFFER_SIZE];
 struct TlvHeader MessageCenter::decodeHeaders_[TLVCODEC_TLV_SLOTS_FOR_FRAME_BYTES(RX_BUFFER_SIZE)];
 uint8_t *MessageCenter::decodeData_[TLVCODEC_TLV_SLOTS_FOR_FRAME_BYTES(RX_BUFFER_SIZE)];
-uint8_t *MessageCenter::txBuffer_;
-uint16_t MessageCenter::txPendingLen_ = 0;
-uint16_t MessageCenter::txPendingOffset_ = 0;
+uint16_t MessageCenter::txQueuedLen_[TX_QUEUE_DEPTH] = {0};
+uint16_t MessageCenter::txQueuedOffset_[TX_QUEUE_DEPTH] = {0};
+uint8_t MessageCenter::txHead_ = 0;
+uint8_t MessageCenter::txTail_ = 0;
+uint8_t MessageCenter::txQueuedFrames_ = 0;
 uint32_t MessageCenter::txDroppedFrames_ = 0;
 
 uint32_t MessageCenter::lastHeartbeatMs_ = 0;
@@ -187,13 +191,18 @@ void MessageCenter::init()
 
     // Initialise TX encoder using static storage to avoid AVR heap pressure.
     memset(&encodeDesc_, 0, sizeof(encodeDesc_));
-    encodeDesc_.buffer = txStorage_;
+    encodeDesc_.buffer = txStorage_[0];
     encodeDesc_.bufferSize = TX_BUFFER_SIZE;
     encodeDesc_.bufferIndex = sizeof(struct FrameHeader);
     encodeDesc_.crc = ENABLE_CRC_CHECK;
     memcpy(encodeDesc_.frameHeader.magicNum, FRAME_HEADER_MAGIC_NUM, sizeof(FRAME_HEADER_MAGIC_NUM));
     encodeDesc_.frameHeader.deviceId = DEVICE_ID;
-    txBuffer_ = encodeDesc_.buffer;
+    memset(txStorage_, 0, sizeof(txStorage_));
+    memset(txQueuedLen_, 0, sizeof(txQueuedLen_));
+    memset(txQueuedOffset_, 0, sizeof(txQueuedOffset_));
+    txHead_ = 0;
+    txTail_ = 0;
+    txQueuedFrames_ = 0;
 
     // Initialise RX decoder using static storage to avoid malloc() in setup().
     memset(&decodeDesc_, 0, sizeof(decodeDesc_));
@@ -265,12 +274,26 @@ void MessageCenter::init()
 #endif
 }
 
+uint16_t MessageCenter::getTxPendingBytes()
+{
+    uint16_t total = 0;
+    for (uint8_t i = 0; i < txQueuedFrames_; ++i) {
+        const uint8_t slot = (uint8_t)((txHead_ + i) % TX_QUEUE_DEPTH);
+        if (txQueuedOffset_[slot] < txQueuedLen_[slot]) {
+            total = (uint16_t)(total + (txQueuedLen_[slot] - txQueuedOffset_[slot]));
+        }
+    }
+    return total;
+}
+
 // ============================================================================
 // FRAME HELPERS
 // ============================================================================
 
 void MessageCenter::beginFrame()
 {
+    encodeDesc_.buffer = txStorage_[txTail_];
+    encodeDesc_.bufferSize = TX_BUFFER_SIZE;
     resetDescriptor(&encodeDesc_);
 }
 
@@ -304,26 +327,32 @@ bool MessageCenter::appendTelemetryTlv(uint16_t tlvType, uint16_t tlvLen, const 
     return true;
 }
 
-void MessageCenter::sendFrame()
+bool MessageCenter::sendFrame()
 {
     // Only send if at least one TLV was appended
     if (encodeDesc_.frameHeader.numTlvs == 0)
-        return;
+        return false;
 
-    if (txPendingOffset_ < txPendingLen_) {
-        txDroppedFrames_++;
-        return;
+    if (txQueuedFrames_ >= TX_QUEUE_DEPTH) {
+        drainTx();
+        if (txQueuedFrames_ >= TX_QUEUE_DEPTH) {
+            txDroppedFrames_++;
+            return false;
+        }
     }
 
     int n = wrapupBuffer(&encodeDesc_);
     if (n > 0)
     {
-        txPendingLen_ = (uint16_t)n;
-        txPendingOffset_ = 0;
+        txQueuedLen_[txTail_] = (uint16_t)n;
+        txQueuedOffset_[txTail_] = 0;
+        txTail_ = (uint8_t)((txTail_ + 1U) % TX_QUEUE_DEPTH);
+        txQueuedFrames_++;
         txFramesWindow_++;
         uint32_t txBytesSum = (uint32_t)txBytesWindow_ + (uint32_t)n;
         txBytesWindow_ = (txBytesSum > 0xFFFFUL) ? 0xFFFFU : (uint16_t)txBytesSum;
         drainTx();
+        return true;
     }
 
 #ifdef DEBUG_TLV_PACKETS
@@ -333,17 +362,35 @@ void MessageCenter::sendFrame()
     DEBUG_LOG.print(n);
     DEBUG_LOG.println(F(" bytes"));
 #endif
+
+    return false;
 }
 
 void MessageCenter::drainTx()
 {
-    while (txPendingOffset_ < txPendingLen_ && bit_is_set(UCSR2A, UDRE2)) {
-        UDR2 = txBuffer_[txPendingOffset_++];
-    }
+    const uint32_t startUs = micros();
 
-    if (txPendingOffset_ >= txPendingLen_) {
-        txPendingLen_ = 0;
-        txPendingOffset_ = 0;
+    while (txQueuedFrames_ > 0U) {
+        if (!bit_is_set(UCSR2A, UDRE2)) {
+            if ((uint16_t)(micros() - startUs) >= kTxDrainBudgetUs) {
+                break;
+            }
+            continue;
+        }
+
+        const uint8_t slot = txHead_;
+        UDR2 = txStorage_[slot][txQueuedOffset_[slot]++];
+
+        if (txQueuedOffset_[slot] >= txQueuedLen_[slot]) {
+            txQueuedLen_[slot] = 0;
+            txQueuedOffset_[slot] = 0;
+            txHead_ = (uint8_t)((txHead_ + 1U) % TX_QUEUE_DEPTH);
+            txQueuedFrames_--;
+        }
+
+        if ((uint16_t)(micros() - startUs) >= kTxDrainBudgetUs) {
+            break;
+        }
     }
 }
 
@@ -563,36 +610,21 @@ void MessageCenter::snapshotTrafficWindow(uint16_t &rxBytes,
 void MessageCenter::sendTelemetry()
 {
     const uint8_t slot = telemetrySlot_;
-    telemetrySlot_ = (uint8_t)((telemetrySlot_ + 1U) % 10U);
 
     // Do not rebuild the shared TX buffer while the previous frame is still
     // draining. sendFrame() also guards this, but by that point beginFrame()
     // and the appendTelemetryTlv() calls would already have overwritten
     // txStorage_, corrupting the in-flight frame on the wire.
-    if (txPendingOffset_ < txPendingLen_) {
-        txDroppedFrames_++;
-        return;
+    if (txQueuedFrames_ >= TX_QUEUE_DEPTH) {
+        drainTx();
+        if (txQueuedFrames_ >= TX_QUEUE_DEPTH) {
+            txDroppedFrames_++;
+            return;
+        }
     }
 
     uint32_t currentMs = millis();
     SystemState state = SystemManager::getState();
-    bool running = (state == SYS_STATE_RUNNING);
-    bool runningOrError = (state == SYS_STATE_RUNNING || state == SYS_STATE_ERROR);
-    const bool evenFastLane = (slot & 1U) == 0U;
-    const bool oddFastLane = !evenFastLane;
-    const bool anyStepperActive = StepperManager::anyEnabled() || StepperManager::anyMoving();
-    const bool servoEnabled = ServoController::isEnabled();
-    const uint32_t dcStateInterval = TELEMETRY_DC_STATE_MS;
-    const uint32_t stepStateInterval = anyStepperActive ? TELEMETRY_STEP_STATE_MS
-                                                        : (uint32_t)TELEMETRY_STEP_STATE_MS * 4UL;
-    const uint32_t servoStateInterval = servoEnabled ? TELEMETRY_SERVO_STATE_MS
-                                                     : (uint32_t)TELEMETRY_SERVO_STATE_MS * 4UL;
-    const uint32_t sysStateInterval = runningOrError ? TELEMETRY_SYS_STATE_RUN_MS
-                                                     : TELEMETRY_SYS_STATE_IDLE_MS;
-    const uint32_t sysPowerInterval = runningOrError ? TELEMETRY_SYS_POWER_RUN_MS
-                                                     : TELEMETRY_SYS_POWER_IDLE_MS;
-    const uint32_t kinematicsInterval = running ? TELEMETRY_KINEMATICS_MS
-                                                : TELEMETRY_KINEMATICS_IDLE_MS;
 
     if (state != SYS_STATE_INIT) {
         UserIO::sampleInputs();
@@ -636,28 +668,12 @@ void MessageCenter::sendTelemetry()
         pendingStepConfigRspMask_ &= (uint8_t)~(1u << bit);
         sendStepConfigRsp(bit);
     }
-
-    // ---- Core system streams first so link / fault state wins under TX pressure ----
-    if (state != SYS_STATE_INIT &&
-        currentMs - lastSysStateSendMs_ >= sysStateInterval &&
-        slot == 1U)
-    {
-        lastSysStateSendMs_ = currentMs;
-        sendSysState();
+    if (encodeDesc_.frameHeader.numTlvs > 0U) {
+        sendFrame();
+        return;
     }
 
-    if (state != SYS_STATE_INIT &&
-        currentMs - lastSysPowerSendMs_ >= sysPowerInterval &&
-        slot == 6U)
-    {
-        lastSysPowerSendMs_ = currentMs;
-        sendSysPower();
-    }
-
-    // ---- Urgent input state changes first ----
-    // Send button / limit updates in their own tiny frame as soon as the
-    // sampled state changes so they do not wait behind the heavier RUNNING
-    // telemetry batch.
+    // ---- Immediate runtime state changes first ----
     if (state != SYS_STATE_INIT && pendingIOInputState_) {
         if (sendIOInputState()) {
             pendingIOInputState_ = false;
@@ -666,110 +682,130 @@ void MessageCenter::sendTelemetry()
             return;
         }
     }
-
-    // Button and limit state are needed in IDLE as well so the UI and student
-    // robot node can react immediately before entering RUNNING. Keep this
-    // ahead of kinematics so RUNNING UI input remains snappy under TX pressure.
-    if (state != SYS_STATE_INIT &&
-        oddFastLane &&
-        currentMs - lastIOInputStateSendMs_ >= TELEMETRY_IO_INPUT_STATE_MS)
-    {
-        if (sendIOInputState()) {
-            lastIOInputStateSendMs_ = currentMs;
-        }
+    if (state != SYS_STATE_INIT && pendingDCStatus_) {
+        pendingDCStatus_ = false;
+        sendDCStateAll();
+        sendFrame();
+        return;
     }
-
-    // ---- Runtime streams (RUNNING only) ----
-    if (running)
-    {
-        if (pendingDCStatus_ ||
-            (evenFastLane &&
-             currentMs - lastDCStateSendMs_ >= dcStateInterval))
-        {
-            lastDCStateSendMs_ = currentMs;
-            pendingDCStatus_ = false;
-            sendDCStateAll();
-        }
-
-        if (SensorManager::isIMUAvailable() &&
-            evenFastLane &&
-            currentMs - lastIMUSendMs_ >= TELEMETRY_IMU_MS)
-        {
-            lastIMUSendMs_ = currentMs;
-            sendSensorIMU();
-        }
-
-        if (oddFastLane &&
-            currentMs - lastStepStateSendMs_ >= stepStateInterval)
-        {
-            lastStepStateSendMs_ = currentMs;
-            sendStepStateAll();
-        }
-    }
-
-    // IMU data is useful in IDLE for bring-up and calibration workflows, so
-    // keep a dedicated configurable idle cadence.
-    if (!running &&
-        state != SYS_STATE_INIT &&
-        SensorManager::isIMUAvailable() &&
-        evenFastLane &&
-        currentMs - lastIMUSendMs_ >= TELEMETRY_IMU_IDLE_MS)
-    {
-        lastIMUSendMs_ = currentMs;
-        sendSensorIMU();
-    }
-
-    if (state != SYS_STATE_INIT &&
-        oddFastLane &&
-        currentMs - lastKinematicsSendMs_ >= kinematicsInterval)
-    {
-        lastKinematicsSendMs_ = currentMs;
-        sendSensorKinematics();
-    }
-
-    // Servo status is needed in IDLE as well because the UI can enable and
-    // position servos outside RUNNING. Keep the periodic stream in RUNNING, but
-    // allow immediate state refresh after commands in any non-INIT state.
-    if (state != SYS_STATE_INIT &&
-        (pendingServoStatus_ ||
-         (running &&
-          currentMs - lastServoStateSendMs_ >= servoStateInterval &&
-          slot == 3U)))
-    {
-        lastServoStateSendMs_ = currentMs;
+    if (state != SYS_STATE_INIT && pendingServoStatus_) {
         pendingServoStatus_ = false;
         sendServoStateAll();
+        sendFrame();
+        return;
     }
-
-    if (state != SYS_STATE_INIT &&
-        (pendingIOOutputState_ ||
-         (currentMs - lastIOOutputStateSendMs_ >= TELEMETRY_IO_OUTPUT_STATE_MS &&
-          slot == 4U)))
-    {
-        lastIOOutputStateSendMs_ = currentMs;
+    if (state != SYS_STATE_INIT && pendingIOOutputState_) {
         pendingIOOutputState_ = false;
         sendIOOutputState();
+        sendFrame();
+        return;
     }
-
-    // ---- Mag cal status at 5 Hz while sampling ----
-    if (SensorManager::getMagCalData().state == MAG_CAL_STATE_SAMPLING)
-    {
-        if (currentMs - lastMagCalSendMs_ >= 200 && slot == 8U)
-        {
-            lastMagCalSendMs_ = currentMs;
-            sendMagCalStatus();
-        }
-    }
-
-    // ---- Queued immediate mag cal response (STOP / SAVE / APPLY / CLEAR) ----
-    if (pendingMagCal_)
-    {
+    if (pendingMagCal_) {
         pendingMagCal_ = false;
         sendMagCalStatus();
+        sendFrame();
+        return;
+    }
+
+    // ---- Fixed telemetry superframe ----
+    // The UART link is still polled, not interrupt-driven. To keep telemetry
+    // reliable at 200 kbaud while DC motors are active, keep the sustained
+    // wire load comfortably below the raw baud-rate budget:
+    //   - kinematics: 40 Hz
+    //   - DC state:   20 Hz
+    //   - step state: 30 Hz
+    //   - IMU:        20 Hz
+    //   - IO input:   20 Hz
+    //   - bulk aux streams (servo/sys/io out): 10 Hz
+    // This keeps every stream available, but reduces the average bytes/second
+    // enough that the 2-slot TX queue can absorb motion-induced service jitter.
+    if (state != SYS_STATE_INIT) {
+        switch (slot) {
+            case 0:
+                if (sendSensorKinematics()) {
+                    lastKinematicsSendMs_ = currentMs;
+                }
+                if (sendIOInputState()) {
+                    lastIOInputStateSendMs_ = currentMs;
+                }
+                break;
+
+            case 1:
+                sendDCStateAll();
+                lastDCStateSendMs_ = currentMs;
+                break;
+
+            case 2:
+                sendStepStateAll();
+                lastStepStateSendMs_ = currentMs;
+                break;
+
+            case 3:
+                if (SensorManager::isIMUAvailable()) {
+                    sendSensorIMU();
+                    lastIMUSendMs_ = currentMs;
+                }
+                sendSysPower();
+                lastSysPowerSendMs_ = currentMs;
+                break;
+
+            case 4:
+                if (sendSensorKinematics()) {
+                    lastKinematicsSendMs_ = currentMs;
+                }
+                break;
+
+            case 5:
+                sendServoStateAll();
+                sendSysState();
+                lastServoStateSendMs_ = currentMs;
+                lastSysStateSendMs_ = currentMs;
+                break;
+
+            case 6:
+                sendDCStateAll();
+                lastDCStateSendMs_ = currentMs;
+                if (sendIOInputState()) {
+                    lastIOInputStateSendMs_ = currentMs;
+                }
+                break;
+
+            case 7:
+                sendStepStateAll();
+                lastStepStateSendMs_ = currentMs;
+                if (sendSensorKinematics()) {
+                    lastKinematicsSendMs_ = currentMs;
+                }
+                break;
+
+            case 8:
+                if (SensorManager::isIMUAvailable()) {
+                    sendSensorIMU();
+                    lastIMUSendMs_ = currentMs;
+                }
+                sendIOOutputState();
+                lastIOOutputStateSendMs_ = currentMs;
+                break;
+
+            case 9:
+                sendStepStateAll();
+                lastStepStateSendMs_ = currentMs;
+                if (sendSensorKinematics()) {
+                    lastKinematicsSendMs_ = currentMs;
+                }
+                if (SensorManager::getMagCalData().state == MAG_CAL_STATE_SAMPLING) {
+                    sendMagCalStatus();
+                    lastMagCalSendMs_ = currentMs;
+                }
+                break;
+        }
     }
 
     // Transmit the completed frame (no-ops if nothing was appended)
-    sendFrame();
+    const bool queued = sendFrame();
+    if (queued || encodeDesc_.frameHeader.numTlvs == 0U) {
+        telemetrySlot_ = (uint8_t)((slot + 1U) % 10U);
+    }
 }
 
 // ============================================================================
@@ -1280,7 +1316,6 @@ void MessageCenter::handleDCSetPosition(const PayloadDCSetPosition *payload)
         motor.enable(DC_MODE_POSITION);
 
     motor.setTargetPosition(payload->targetTicks);
-    pendingDCStatus_ = true;
 }
 
 void MessageCenter::handleDCSetVelocity(const PayloadDCSetVelocity *payload)
@@ -1298,7 +1333,6 @@ void MessageCenter::handleDCSetVelocity(const PayloadDCSetVelocity *payload)
         motor.enable(DC_MODE_VELOCITY);
 
     motor.setTargetVelocity((float)payload->targetTicks);
-    pendingDCStatus_ = true;
 }
 
 void MessageCenter::handleDCSetPWM(const PayloadDCSetPWM *payload)
@@ -1316,7 +1350,6 @@ void MessageCenter::handleDCSetPWM(const PayloadDCSetPWM *payload)
         motor.enable(DC_MODE_PWM);
 
     motor.setDirectPWM(payload->pwm);
-    pendingDCStatus_ = true;
 }
 
 void MessageCenter::handleDCResetPosition(const PayloadDCResetPosition *payload)
@@ -1689,7 +1722,7 @@ void MessageCenter::sendSensorIMU()
     appendTelemetryTlv(SENSOR_IMU, sizeof(payload), &payload);
 }
 
-void MessageCenter::sendSensorKinematics()
+bool MessageCenter::sendSensorKinematics()
 {
     PayloadSensorKinematics payload;
     payload.x = RobotKinematics::getX();
@@ -1700,7 +1733,7 @@ void MessageCenter::sendSensorKinematics()
     payload.vTheta = RobotKinematics::getVTheta();
     payload.timestamp = micros();
 
-    appendTelemetryTlv(SENSOR_KINEMATICS, sizeof(payload), &payload);
+    return appendTelemetryTlv(SENSOR_KINEMATICS, sizeof(payload), &payload);
 }
 
 void MessageCenter::sendSysPower()

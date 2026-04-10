@@ -262,6 +262,7 @@ static bool fastFaultEvents() {
   static uint16_t lastFrameCount = 0U;
   static uint16_t lastTlvCount = 0U;
   static uint16_t lastOversizeCount = 0U;
+  static uint32_t lastTxDroppedFrames = 0U;
   static uint32_t lastEmitMs = 0U;
 
   if (DebugLog::getQueuedBytes() > (DEBUG_LOG_BUFFER_SIZE / 2U)) {
@@ -273,15 +274,22 @@ static bool fastFaultEvents() {
     return false;
   }
 
+  uint16_t rxAvailable = (uint16_t)RPI_SERIAL.available();
+  uint16_t txPending = MessageCenter::getTxPendingBytes();
+  uint32_t txDroppedFrames = MessageCenter::getTxDroppedFrames();
+  uint32_t txDroppedDelta = txDroppedFrames - lastTxDroppedFrames;
+
   char loopDeltaBuf[64];
   loopDeltaBuf[0] = '\0';
   bool firstLoopDelta = true;
+  uint16_t loopDeltas[LOOP_SLOT_COUNT] = {};
   static const char *const kLoopTokens[LOOP_SLOT_COUNT] = {
     "pid", "step", "motor", "sensor", "uart", "io"
   };
   for (uint8_t i = 0; i < LOOP_SLOT_COUNT; ++i) {
     uint16_t faultCount = LoopMonitor::getFaultCount((LoopSlot)i);
     uint16_t delta = (uint16_t)(faultCount - lastLoopFaultCounts[i]);
+    loopDeltas[i] = delta;
     lastLoopFaultCounts[i] = faultCount;
     appendLoopFaultDelta(loopDeltaBuf, sizeof(loopDeltaBuf), firstLoopDelta, kLoopTokens[i], delta);
   }
@@ -291,7 +299,12 @@ static bool fastFaultEvents() {
   appendLoopFaultDelta(loopDeltaBuf, sizeof(loopDeltaBuf), firstLoopDelta, "pidr", pidRoundDelta);
 
   if (!firstLoopDelta) {
-    DebugLog::printf_P(PSTR("[LOOP] %s\n"), loopDeltaBuf);
+    DebugLog::printf_P(PSTR("[LOOP] %s | rx=%u tx=%u qfull+%lu\n"),
+                       loopDeltaBuf,
+                       (unsigned)rxAvailable,
+                       (unsigned)txPending,
+                       (unsigned long)txDroppedDelta);
+    lastTxDroppedFrames = txDroppedFrames;
     lastEmitMs = now;
     return true;
   }
@@ -326,15 +339,19 @@ static bool fastFaultEvents() {
   uint32_t reusedDelta = reusedCount - lastReusedCount;
   uint32_t crossDelta = crossCount - lastCrossCount;
   if (missedDelta != 0U || lateDelta != 0U || reusedDelta != 0U || crossDelta != 0U) {
-    DebugLog::printf_P(PSTR("[CTRL] miss+%lu late+%lu reuse+%lu cross+%lu\n"),
+    DebugLog::printf_P(PSTR("[CTRL] miss+%lu late+%lu reuse+%lu cross+%lu | rx=%u tx=%u qfull+%lu\n"),
                        (unsigned long)missedDelta,
                        (unsigned long)lateDelta,
                        (unsigned long)reusedDelta,
-                       (unsigned long)crossDelta);
+                       (unsigned long)crossDelta,
+                       (unsigned)rxAvailable,
+                       (unsigned)txPending,
+                       (unsigned long)txDroppedDelta);
     lastMissedCount = missedCount;
     lastLateCount = lateCount;
     lastReusedCount = reusedCount;
     lastCrossCount = crossCount;
+    lastTxDroppedFrames = txDroppedFrames;
     lastEmitMs = now;
     return true;
   }
@@ -358,19 +375,23 @@ static bool fastFaultEvents() {
   uint16_t oversizeDelta = (uint16_t)(oversizeCount - lastOversizeCount);
   if (dorDelta != 0U || feDelta != 0U || crcDelta != 0U ||
       frameDelta != 0U || tlvDelta != 0U || oversizeDelta != 0U) {
-    DebugLog::printf_P(PSTR("[UART] dor+%lu fe+%lu crc+%u frame+%u tlv+%u oversize+%u\n"),
+    DebugLog::printf_P(PSTR("[UART] dor+%lu fe+%lu crc+%u frame+%u tlv+%u oversize+%u | rx=%u tx=%u qfull+%lu\n"),
                        (unsigned long)dorDelta,
                        (unsigned long)feDelta,
                        (unsigned)crcDelta,
                        (unsigned)frameDelta,
                        (unsigned)tlvDelta,
-                       (unsigned)oversizeDelta);
+                       (unsigned)oversizeDelta,
+                       (unsigned)rxAvailable,
+                       (unsigned)txPending,
+                       (unsigned long)txDroppedDelta);
     lastDorCount = dorCount;
     lastFeCount = feCount;
     lastCrcCount = crcCount;
     lastFrameCount = frameCount;
     lastTlvCount = tlvCount;
     lastOversizeCount = oversizeCount;
+    lastTxDroppedFrames = txDroppedFrames;
     lastEmitMs = now;
     return true;
   }
@@ -380,6 +401,26 @@ static bool fastFaultEvents() {
   lastFrameCount = frameCount;
   lastTlvCount = tlvCount;
   lastOversizeCount = oversizeCount;
+
+  const bool rxBacklogged = rxAvailable >= 16U;
+  const bool txBacklogged = txPending >= (TX_FRAME_SOFT_LIMIT / 2U);
+  const bool sensorResourceDelta = loopDeltas[SLOT_SENSOR_ISR] != 0U;
+  const bool uartResourceDelta = loopDeltas[SLOT_UART_TASK] != 0U;
+  if (rxBacklogged || txBacklogged || txDroppedDelta != 0U ||
+      sensorResourceDelta || uartResourceDelta) {
+    DebugLog::printf_P(PSTR("[RES] rx=%u tx=%u qfull+%lu sensor+%u uart+%u loopMax=%uus\n"),
+                       (unsigned)rxAvailable,
+                       (unsigned)txPending,
+                       (unsigned long)txDroppedDelta,
+                       (unsigned)loopDeltas[SLOT_SENSOR_ISR],
+                       (unsigned)loopDeltas[SLOT_UART_TASK],
+                       (unsigned)MessageCenter::getLoopTimeMaxUs());
+    lastTxDroppedFrames = txDroppedFrames;
+    lastEmitMs = now;
+    return true;
+  }
+
+  lastTxDroppedFrames = txDroppedFrames;
 
   return false;
 #endif
@@ -398,6 +439,40 @@ static bool fastDebugFlush() {
   DebugLog::flush();
   StatusReporter::recordFlushTimingUs(Utility::clampElapsedUs(micros() - flushStartUs));
   return DebugLog::getQueuedBytes() != before;
+}
+
+static void serviceControlFirstFastLaneBurst() {
+  // Allow at most two motor compute chunks before forcing a UART service
+  // opportunity. This still keeps motor compute highest priority, but avoids
+  // long TX/RX service gaps while DC motors are active.
+  constexpr uint8_t kMaxControlFastLaneBurst = 2;
+
+  uint8_t burstCount = 0;
+  while (Scheduler::serviceFastLane()) {
+    if (!MotorControlCoordinator::hasPendingRound()) {
+      break;
+    }
+    if (++burstCount >= kMaxControlFastLaneBurst) {
+      fastDrainUart();
+      fastDrainTx();
+      break;
+    }
+  }
+}
+
+static void servicePeriodicBurst() {
+  // One tickPeriodic() call only runs one overdue soft task. In RUNNING, UART,
+  // safety, and motor feedback can all be due before the 100 Hz sensor task.
+  // Drain a short periodic backlog each loop pass so odometry/IMU work does
+  // not fall far behind while the DC controller is active.
+  constexpr uint8_t kMaxPeriodicBurst = 4;
+
+  for (uint8_t i = 0; i < kMaxPeriodicBurst; ++i) {
+    Scheduler::tickPeriodic();
+    if (MotorControlCoordinator::hasPendingRound()) {
+      serviceControlFirstFastLaneBurst();
+    }
+  }
 }
 
 /**
@@ -753,21 +828,21 @@ void setup() {
   // 6. Register cooperative fast-lane and periodic soft tasks.
   DEBUG_SERIAL.println(F("[Setup] Registering scheduler tasks..."));
 
-  fastTaskId = Scheduler::registerFastTask(fastDrainUart, 0);
+  fastTaskId = Scheduler::registerFastTask(fastMotorCompute, 0);
+  if (fastTaskId >= 0) {
+    DEBUG_SERIAL.print(F("  - Fast MotorCompute: Task #"));
+    DEBUG_SERIAL.println(fastTaskId);
+  }
+
+  fastTaskId = Scheduler::registerFastTask(fastDrainUart, 1);
   if (fastTaskId >= 0) {
     DEBUG_SERIAL.print(F("  - Fast UART RX: Task #"));
     DEBUG_SERIAL.println(fastTaskId);
   }
 
-  fastTaskId = Scheduler::registerFastTask(fastDrainTx, 1);
+  fastTaskId = Scheduler::registerFastTask(fastDrainTx, 2);
   if (fastTaskId >= 0) {
     DEBUG_SERIAL.print(F("  - Fast UART TX: Task #"));
-    DEBUG_SERIAL.println(fastTaskId);
-  }
-
-  fastTaskId = Scheduler::registerFastTask(fastMotorCompute, 2);
-  if (fastTaskId >= 0) {
-    DEBUG_SERIAL.print(F("  - Fast MotorCompute: Task #"));
     DEBUG_SERIAL.println(fastTaskId);
   }
 
@@ -876,13 +951,7 @@ void setup() {
 void loop() {
   StatusReporter::recordLoopGap();
   StatusReporter::updateWindowPeaks();
-  while (Scheduler::serviceFastLane() && MotorControlCoordinator::hasPendingRound()) {
-    // Keep draining the highest-priority fast lane while DC control is
-    // backlogged so periodic UART/sensor work does not interleave between
-    // per-slot catch-up passes.
-  }
-  Scheduler::tickPeriodic();
-  while (Scheduler::serviceFastLane() && MotorControlCoordinator::hasPendingRound()) {
-    // Same control-first catch-up rule after the periodic task pass.
-  }
+  serviceControlFirstFastLaneBurst();
+  servicePeriodicBurst();
+  serviceControlFirstFastLaneBurst();
 }

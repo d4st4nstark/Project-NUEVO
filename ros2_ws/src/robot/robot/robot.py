@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import math
 import time
 import threading
@@ -10,6 +11,7 @@ from rclpy.node import Node
 from bridge_interfaces.msg import (
     DCEnable,
     DCHome,
+    DCPid,
     DCPidReq,
     DCPidSet,
     DCResetPosition,
@@ -19,11 +21,14 @@ from bridge_interfaces.msg import (
     DCStateAll,
     IOSetLed,
     IOSetNeopixel,
+    IOOutputState,
     SensorImu,
     SensorKinematics,
     ServoEnable,
     ServoSet,
     ServoStateAll,
+    StepConfig,
+    StepConfigReq,
     StepConfigSet,
     StepEnable,
     StepHome,
@@ -33,13 +38,14 @@ from bridge_interfaces.msg import (
     SysOdomParamRsp,
     SysOdomParamSet,
     SysOdomReset,
+    SystemConfig,
+    SystemDiag,
+    SystemInfo,
     SystemPower,
     SystemState,
     IOInputState,
 )
 from bridge_interfaces.srv import SetFirmwareState
-
-from robot.sensor_fusion import ComplementaryFilter, SensorFusion
 
 from robot.hardware_map import (
     BUTTON_COUNT,
@@ -61,6 +67,8 @@ from robot.hardware_map import (
 class Unit(Enum):
     MM   = 1.0   # native firmware units; no conversion needed
     INCH = 25.4  # 1 inch = 25.4 mm
+    AMERICAN = INCH
+    REST_OF_THE_WORLD = MM
 
 
 class FirmwareState(IntEnum):
@@ -71,30 +79,42 @@ class FirmwareState(IntEnum):
 
 
 # =============================================================================
-# MotionHandle  (returned by non-blocking navigation commands)
+# MotionHandle  (for high-level base motion)
 # =============================================================================
 
 class MotionHandle:
     """
-    Handle for a non-blocking navigation command.
+    Handle for a high-level base-motion command.
+
+    This is used by the navigation-style APIs in Robot, such as:
+    - move_to / move_by / move_forward / move_backward
+    - turn_to / turn_by
+    - purepursuit_follow_path / apf_follow_path
+
+    These methods always return a MotionHandle. When blocking=True, the method
+    waits internally before returning the already-finished handle.
 
     Example:
-        handle = robot.move_to(500, 0, 200, blocking=False)
+        handle = robot.move_to(500, 0, 200, tolerance=15, blocking=False)
         # ... do other things ...
         success = handle.wait(timeout=10.0)
     """
 
-    def __init__(self, done_event: threading.Event, cancel_event: threading.Event) -> None:
-        self._done   = done_event
+    def __init__(self, finished_event: threading.Event, cancel_event: threading.Event) -> None:
+        self._finished = finished_event
         self._cancel = cancel_event
 
     def wait(self, timeout: float = None) -> bool:
-        """Block until motion completes. Returns True on success, False on timeout."""
-        return self._done.wait(timeout=timeout)
+        """Block until motion finishes. Returns True if it finished before timeout."""
+        return self._finished.wait(timeout=timeout)
+
+    def is_finished(self) -> bool:
+        """Non-blocking poll. Returns True if motion has finished."""
+        return self._finished.is_set()
 
     def is_done(self) -> bool:
-        """Non-blocking poll. Returns True if motion has completed."""
-        return self._done.is_set()
+        """Backward-compatible alias for is_finished()."""
+        return self.is_finished()
 
     def cancel(self) -> None:
         """Abort this motion command. The robot will stop."""
@@ -168,13 +188,19 @@ class Robot:
         # ── Cached firmware state ─────────────────────────────────────────────
         self._sys_state:  int            = 0
         self._sys_power:  SystemPower    = None
+        self._sys_info:   SystemInfo     = None
+        self._sys_config: SystemConfig   = None
+        self._sys_diag:   SystemDiag     = None
         self._dc_state:   DCStateAll     = None
+        self._dc_pid_cache: dict[tuple[int, int], DCPid] = {}
         self._step_state: StepStateAll   = None
+        self._step_config_cache: dict[int, StepConfig] = {}
         self._servo_state: ServoStateAll = None
+        self._io_output_state: IOOutputState = None
         self._imu:        SensorImu      = None
         self._mag_heading:  float | None = None   # absolute heading from magnetometer (rad)
-        self._fused_theta:  float        = 0.0    # fusion strategy output (rad)
-        self._fusion: SensorFusion = ComplementaryFilter(alpha=0.02)
+        self._fused_theta:  float        = 0.0    # complementary-filter output (rad)
+        self._fusion_alpha: float        = 0.02   # mag weight [0 = all odometry, 1 = all mag]
         self._pose:    tuple = (0.0, 0.0, 0.0)  # x_mm, y_mm, theta_rad
         self._vel:     tuple = (0.0, 0.0, 0.0)  # vx_mm_s, vy_mm_s, vtheta_rad_s
         self._buttons: int   = 0
@@ -182,6 +208,8 @@ class Robot:
         self._button_edges: int = 0
         self._limit_edges: int = 0
         self._have_io_input: bool = False
+        self._obstacles_mm: list[tuple[float, float]] = []
+        self._obstacle_provider: Callable[[], list[tuple[float, float]]] | None = None
 
         # ── Events ────────────────────────────────────────────────────────────
         self._pose_event: threading.Event = threading.Event()
@@ -205,6 +233,7 @@ class Robot:
         self._step_en_pub  = node.create_publisher(StepEnable,     '/step_enable',      10)
         self._step_mv_pub  = node.create_publisher(StepMove,       '/step_move',        10)
         self._step_hm_pub  = node.create_publisher(StepHome,       '/step_home',        10)
+        self._step_cfg_req_pub = node.create_publisher(StepConfigReq, '/step_config_req', 10)
         self._step_cfg_pub = node.create_publisher(StepConfigSet,  '/step_config_set',  10)
         self._srv_en_pub   = node.create_publisher(ServoEnable,    '/servo_enable',     10)
         self._srv_set_pub  = node.create_publisher(ServoSet,       '/servo_set',        10)
@@ -217,12 +246,18 @@ class Robot:
         # ── Subscriptions ─────────────────────────────────────────────────────
         node.create_subscription(SystemState,      '/sys_state',         self._on_sys_state,   10)
         node.create_subscription(SystemPower,      '/sys_power',         self._on_sys_power,   10)
+        node.create_subscription(SystemInfo,       '/sys_info_rsp',      self._on_sys_info,    10)
+        node.create_subscription(SystemConfig,     '/sys_config_rsp',    self._on_sys_config,  10)
+        node.create_subscription(SystemDiag,       '/sys_diag_rsp',      self._on_sys_diag,    10)
+        node.create_subscription(DCPid,            '/dc_pid_rsp',        self._on_dc_pid,      10)
         node.create_subscription(DCStateAll,       '/dc_state_all',      self._on_dc_state,    10)
+        node.create_subscription(StepConfig,       '/step_config_rsp',   self._on_step_config, 10)
         node.create_subscription(StepStateAll,     '/step_state_all',    self._on_step_state,  10)
         node.create_subscription(ServoStateAll,    '/servo_state_all',   self._on_servo_state, 10)
         node.create_subscription(SensorImu,        '/sensor_imu',        self._on_imu,         10)
         node.create_subscription(SensorKinematics, '/sensor_kinematics', self._on_kinematics,  10)
         node.create_subscription(IOInputState,     '/io_input_state',    self._on_io_input,    10)
+        node.create_subscription(IOOutputState,    '/io_output_state',   self._on_io_output,   10)
         node.create_subscription(SysOdomParamRsp,  '/sys_odom_param_rsp', self._on_odom_param_rsp, 10)
 
         # ── Service clients ───────────────────────────────────────────────────
@@ -243,9 +278,29 @@ class Robot:
         with self._lock:
             self._sys_power = msg
 
+    def _on_sys_info(self, msg: SystemInfo) -> None:
+        with self._lock:
+            self._sys_info = msg
+
+    def _on_sys_config(self, msg: SystemConfig) -> None:
+        with self._lock:
+            self._sys_config = msg
+
+    def _on_sys_diag(self, msg: SystemDiag) -> None:
+        with self._lock:
+            self._sys_diag = msg
+
+    def _on_dc_pid(self, msg: DCPid) -> None:
+        with self._lock:
+            self._dc_pid_cache[(int(msg.motor_number), int(msg.loop_type))] = msg
+
     def _on_dc_state(self, msg: DCStateAll) -> None:
         with self._lock:
             self._dc_state = msg
+
+    def _on_step_config(self, msg: StepConfig) -> None:
+        with self._lock:
+            self._step_config_cache[int(msg.stepper_number)] = msg
 
     def _on_step_state(self, msg: StepStateAll) -> None:
         with self._lock:
@@ -265,12 +320,16 @@ class Robot:
         with self._lock:
             self._pose = (msg.x, msg.y, msg.theta)
             self._vel  = (msg.vx, msg.vy, msg.v_theta)
-            self._fused_theta = self._fusion.update(
-                odom_theta=msg.theta,
-                mag_heading=self._mag_heading,
-                linear_vel=math.hypot(float(msg.vx), float(msg.vy)),
-                angular_vel=float(msg.v_theta),
-            )
+            if self._mag_heading is not None:
+                # Complementary filter: correct odometry heading toward absolute mag heading.
+                # atan2(sin, cos) wraps the difference to [-π, π] before blending.
+                diff = math.atan2(
+                    math.sin(self._mag_heading - msg.theta),
+                    math.cos(self._mag_heading - msg.theta),
+                )
+                self._fused_theta = msg.theta + self._fusion_alpha * diff
+            else:
+                self._fused_theta = msg.theta
         self._pose_event.set()
         self._pose_event.clear()
 
@@ -295,6 +354,10 @@ class Robot:
                 ev = self._limit_events.get(bid)
                 if ev:
                     ev.set()
+
+    def _on_io_output(self, msg: IOOutputState) -> None:
+        with self._lock:
+            self._io_output_state = msg
 
     def _on_odom_param_rsp(self, msg: SysOdomParamRsp) -> None:
         self._apply_odom_param_snapshot(
@@ -354,11 +417,11 @@ class Robot:
         self._odom_pub.publish(msg)
 
     def set_wheel_diameter_mm(self, wheel_diameter_mm: float) -> None:
-        """Update wheel diameter for firmware odometry and robot-side motion conversion."""
+        """Update wheel diameter in explicit millimeters."""
         self._update_odometry_params(wheel_diameter_mm=wheel_diameter_mm)
 
     def set_wheel_base_mm(self, wheel_base_mm: float) -> None:
-        """Update wheel base for firmware odometry and robot-side diff-drive mixing."""
+        """Update wheel base in explicit millimeters."""
         self._update_odometry_params(wheel_base_mm=wheel_base_mm)
 
     def set_initial_theta(self, theta_deg: float) -> None:
@@ -396,18 +459,25 @@ class Robot:
     def set_odometry_parameters(
         self,
         *,
-        wheel_diameter_mm: float | None = None,
-        wheel_base_mm: float | None = None,
+        wheel_diameter: float | None = None,
+        wheel_base: float | None = None,
         initial_theta_deg: float | None = None,
         left_motor_id: int | None = None,
         left_motor_dir_inverted: bool | None = None,
         right_motor_id: int | None = None,
         right_motor_dir_inverted: bool | None = None,
     ) -> None:
-        """Publish a full odometry-parameter snapshot to firmware in one call."""
+        """
+        Publish a full odometry-parameter snapshot to firmware in one call.
+
+        wheel_diameter and wheel_base are in the current user unit system.
+        Use set_wheel_diameter_mm() / set_wheel_base_mm() when you need to
+        work in explicit raw millimeters instead.
+        """
+        scale = self._unit.value
         self._update_odometry_params(
-            wheel_diameter_mm=wheel_diameter_mm,
-            wheel_base_mm=wheel_base_mm,
+            wheel_diameter_mm=None if wheel_diameter is None else float(wheel_diameter) * scale,
+            wheel_base_mm=None if wheel_base is None else float(wheel_base) * scale,
             initial_theta_deg=initial_theta_deg,
             left_wheel_motor=left_motor_id,
             left_wheel_dir_inverted=left_motor_dir_inverted,
@@ -422,7 +492,7 @@ class Robot:
         self._odom_param_req_pub.publish(msg)
 
     def get_odometry_parameters(self) -> dict[str, float | int | bool]:
-        """Return the latest local odometry parameter snapshot."""
+        """Return the latest local odometry parameter snapshot in firmware-native millimeters."""
         with self._lock:
             return {
                 "wheel_diameter_mm": self._wheel_diameter,
@@ -438,6 +508,21 @@ class Robot:
         """Return cached power state (battery_mv, rail_5v_mv, servo_rail_mv)."""
         with self._lock:
             return self._sys_power
+
+    def get_system_info(self) -> SystemInfo:
+        """Return cached system information from /sys_info_rsp."""
+        with self._lock:
+            return self._sys_info
+
+    def get_system_config(self) -> SystemConfig:
+        """Return cached system configuration from /sys_config_rsp."""
+        with self._lock:
+            return self._sys_config
+
+    def get_system_diag(self) -> SystemDiag:
+        """Return cached system diagnostics from /sys_diag_rsp."""
+        with self._lock:
+            return self._sys_diag
 
     # =========================================================================
     # Pose / odometry
@@ -460,6 +545,49 @@ class Robot:
     def wait_for_pose_update(self, timeout: float = None) -> bool:
         """Block until the next /sensor_kinematics message arrives (~25 Hz)."""
         return self._pose_event.wait(timeout=timeout)
+
+    def set_obstacles(self, obstacles: list[tuple[float, float]]) -> None:
+        """
+        Cache APF obstacles in the robot frame using the current user length unit.
+
+        Each obstacle is (x_forward, y_left) relative to the robot. Future lidar
+        code can either call this repeatedly with fresh detections or install a
+        live provider with set_obstacle_provider().
+        """
+        converted = [
+            (
+                self._require_finite_float("obstacle_x", obs_x) * self._unit.value,
+                self._require_finite_float("obstacle_y", obs_y) * self._unit.value,
+            )
+            for obs_x, obs_y in obstacles
+        ]
+        with self._lock:
+            self._obstacles_mm = converted
+
+    def clear_obstacles(self) -> None:
+        """Clear the cached APF obstacle list set by set_obstacles()."""
+        with self._lock:
+            self._obstacles_mm = []
+
+    def get_obstacles(self) -> list[tuple[float, float]]:
+        """Return the current APF obstacles in the current user length unit."""
+        scale = self._unit.value
+        return [(x_mm / scale, y_mm / scale) for x_mm, y_mm in self._get_obstacles_mm()]
+
+    def set_obstacle_provider(
+        self,
+        provider: Callable[[], list[tuple[float, float]]] | None,
+    ) -> None:
+        """
+        Register a live APF obstacle callback that returns robot-frame positions in mm.
+
+        TODO: a future lidar/object-detection node can install a provider here so
+        APF follows the latest obstacle snapshot without changing the student API.
+        """
+        if provider is not None and not callable(provider):
+            raise TypeError("provider must be callable or None")
+        with self._lock:
+            self._obstacle_provider = provider
 
     # =========================================================================
     # Differential drive — velocity commands
@@ -507,6 +635,8 @@ class Robot:
         time.sleep(self._SHUTDOWN_SETTLE_S)
         self.disable_drive_motors()
         time.sleep(self._SHUTDOWN_SETTLE_S)
+        if self.get_state() == FirmwareState.RUNNING:
+            self.set_state(FirmwareState.IDLE, timeout=1.0)
 
     def set_left_wheel(self, motor_id: int) -> None:
         """Alias for set_odom_left_motor()."""
@@ -535,25 +665,32 @@ class Robot:
         x: float,
         y: float,
         velocity: float,
+        tolerance: float,
         blocking: bool = True,
-        tolerance: float = 15,
         timeout: float = None,
     ):
         """
         Navigate to (x, y) at the given speed.
         Uses pure-pursuit steering. Requires firmware to be in RUNNING state.
 
-        blocking=True  → returns bool (True=arrived, False=timeout)
-        blocking=False → returns MotionHandle
+        Always returns a MotionHandle.
+        blocking=True waits before returning the handle.
         tolerance      — arrival radius in user units
         """
         x_mm   = x         * self._unit.value
         y_mm   = y         * self._unit.value
         vel_mm = velocity  * self._unit.value
         tol_mm = tolerance * self._unit.value
+        lookahead_mm = max(tol_mm * 2.0, 100.0)
 
         def target():
-            self._nav_to_waypoints([(x_mm, y_mm)], vel_mm, tol_mm)
+            self._nav_follow_purepursuit_path(
+                [(x_mm, y_mm)],
+                vel_mm,
+                lookahead_mm,
+                tol_mm,
+                2.0,
+            )
 
         return self._start_nav(target, blocking, timeout)
 
@@ -562,14 +699,193 @@ class Robot:
         dx: float,
         dy: float,
         velocity: float,
+        tolerance: float,
         blocking: bool = True,
-        tolerance: float = 15,
         timeout: float = None,
     ):
         """Navigate by (dx, dy) relative to current pose."""
         cur_x, cur_y, _ = self.get_pose()
         return self.move_to(cur_x + dx, cur_y + dy, velocity,
                             blocking=blocking, tolerance=tolerance, timeout=timeout)
+
+    def move_forward(
+        self,
+        distance: float,
+        velocity: float,
+        tolerance: float,
+        blocking: bool = True,
+        timeout: float = None,
+    ):
+        """
+        Navigate forward by distance along the robot's current heading.
+
+        distance and tolerance are in the current user unit system.
+        """
+        distance = self._require_positive_float("distance", distance)
+        return self._move_along_heading(
+            distance,
+            velocity,
+            tolerance=tolerance,
+            blocking=blocking,
+            timeout=timeout,
+        )
+
+    def move_backward(
+        self,
+        distance: float,
+        velocity: float,
+        tolerance: float,
+        blocking: bool = True,
+        timeout: float = None,
+    ):
+        """
+        Navigate backward by distance along the robot's current heading.
+
+        distance and tolerance are in the current user unit system.
+        """
+        distance = self._require_positive_float("distance", distance)
+        return self._move_along_heading(
+            -distance,
+            velocity,
+            tolerance=tolerance,
+            blocking=blocking,
+            timeout=timeout,
+        )
+
+    def _move_along_heading(
+        self,
+        signed_distance: float,
+        velocity: float,
+        tolerance: float,
+        blocking: bool = True,
+        timeout: float = None,
+    ):
+        """Internal helper: move along the current robot heading by signed_distance."""
+        cur_x, cur_y, cur_theta_deg = self.get_pose()
+        cur_theta_rad = math.radians(cur_theta_deg)
+        dx = math.cos(cur_theta_rad) * signed_distance
+        dy = math.sin(cur_theta_rad) * signed_distance
+        return self.move_to(
+            cur_x + dx,
+            cur_y + dy,
+            velocity,
+            tolerance=tolerance,
+            blocking=blocking,
+            timeout=timeout,
+        )
+
+    def purepursuit_follow_path(
+        self,
+        waypoints: list[tuple[float, float]],
+        velocity: float,
+        lookahead: float,
+        tolerance: float,
+        blocking: bool = True,
+        max_angular_rad_s: float = 1.0,
+        timeout: float = None,
+        *,
+        advance_radius: float | None = None,
+    ):
+        """
+        Follow an ordered waypoint path with pure pursuit.
+
+        waypoints           — [(x, y), ...] in the current user unit system
+        velocity            — maximum forward speed in user units/s
+        lookahead           — lookahead distance in user units
+        tolerance           — goal tolerance in user units
+        advance_radius      — optional intermediate waypoint acceptance radius
+                              in user units; defaults to tolerance
+        max_angular_rad_s   — angular-rate clamp in rad/s
+
+        Always returns a MotionHandle.
+        blocking=True waits before returning the handle.
+        """
+        if not waypoints:
+            raise ValueError("waypoints must not be empty")
+
+        path_mm = [
+            (float(x) * self._unit.value, float(y) * self._unit.value)
+            for x, y in waypoints
+        ]
+        vel_mm = float(velocity) * self._unit.value
+        lookahead_mm = float(lookahead) * self._unit.value
+        tolerance_mm = float(tolerance) * self._unit.value
+        advance_radius_mm = (
+            tolerance_mm if advance_radius is None
+            else float(advance_radius) * self._unit.value
+        )
+        max_angular = float(max_angular_rad_s)
+
+        def target():
+            self._nav_follow_purepursuit_path(
+                path_mm,
+                vel_mm,
+                lookahead_mm,
+                advance_radius_mm,
+                tolerance_mm,
+                max_angular,
+            )
+
+        return self._start_nav(target, blocking, timeout)
+
+    def apf_follow_path(
+        self,
+        waypoints: list[tuple[float, float]],
+        velocity: float,
+        lookahead: float,
+        tolerance: float,
+        repulsion_range: float,
+        blocking: bool = True,
+        max_angular_rad_s: float = 1.0,
+        repulsion_gain: float = 500.0,
+        timeout: float = None,
+        *,
+        advance_radius: float | None = None,
+    ):
+        """
+        Follow an ordered waypoint path with artificial potential fields.
+
+        waypoints         — [(x, y), ...] in the current user unit system
+        velocity          — maximum forward speed in user units/s
+        lookahead         — attractive lookahead distance in user units
+        tolerance         — goal tolerance in user units
+        repulsion_range   — obstacle influence radius in user units
+        advance_radius    — optional intermediate waypoint acceptance radius
+                            in user units; defaults to tolerance
+
+        Obstacles come from set_obstacles() and/or set_obstacle_provider().
+        """
+        if not waypoints:
+            raise ValueError("waypoints must not be empty")
+
+        path_mm = [
+            (float(x) * self._unit.value, float(y) * self._unit.value)
+            for x, y in waypoints
+        ]
+        vel_mm = float(velocity) * self._unit.value
+        lookahead_mm = float(lookahead) * self._unit.value
+        tolerance_mm = float(tolerance) * self._unit.value
+        advance_radius_mm = (
+            tolerance_mm if advance_radius is None
+            else float(advance_radius) * self._unit.value
+        )
+        repulsion_range_mm = float(repulsion_range) * self._unit.value
+        max_angular = float(max_angular_rad_s)
+        repulsion_gain = float(repulsion_gain)
+
+        def target():
+            self._nav_follow_apf_path(
+                path_mm,
+                vel_mm,
+                lookahead_mm,
+                advance_radius_mm,
+                tolerance_mm,
+                repulsion_range_mm,
+                max_angular,
+                repulsion_gain,
+            )
+
+        return self._start_nav(target, blocking, timeout)
 
     def turn_to(
         self,
@@ -581,6 +897,9 @@ class Robot:
         """
         Rotate to an absolute heading. Firmware must be in RUNNING state.
         angle_deg is in degrees (CCW positive, same convention as the firmware).
+
+        Always returns a MotionHandle.
+        blocking=True waits before returning the handle.
         """
         target_rad = math.radians(angle_deg)
         tol_rad    = math.radians(tolerance_deg)
@@ -597,7 +916,12 @@ class Robot:
         tolerance_deg: float = 2.0,
         timeout: float = None,
     ):
-        """Rotate by delta_deg relative to current heading."""
+        """
+        Rotate by delta_deg relative to current heading.
+
+        Always returns a MotionHandle.
+        blocking=True waits before returning the handle.
+        """
         _, _, cur_deg = self.get_pose()
         return self.turn_to(cur_deg + delta_deg,
                             blocking=blocking, tolerance_deg=tolerance_deg, timeout=timeout)
@@ -611,6 +935,8 @@ class Robot:
         self._nav_cancel.set()
         if self._nav_thread is not None:
             self._nav_thread.join(timeout=1.0)
+            if self._nav_thread.is_alive():
+                return
         self._nav_thread = None
         self._nav_cancel.clear()
 
@@ -742,6 +1068,13 @@ class Robot:
         msg.loop_type    = loop_type
         self._dc_pid_req.publish(msg)
 
+    def get_pid(self, motor_id: int, loop_type: DCPidLoop | int) -> DCPid | None:
+        """Return cached PID parameters for one motor/loop pair, or None if unknown."""
+        motor_id = self._require_id("motor_id", motor_id, 1, 4)
+        loop_type = self._require_enum("loop_type", loop_type, DCPidLoop)
+        with self._lock:
+            return self._dc_pid_cache.get((motor_id, loop_type))
+
     def get_dc_state(self) -> DCStateAll:
         """Return cached DC motor state (position, velocity, mode, etc.)."""
         with self._lock:
@@ -830,6 +1163,19 @@ class Robot:
         msg.acceleration   = int(acceleration)
         self._step_cfg_pub.publish(msg)
 
+    def request_step_config(self, stepper_id: int) -> None:
+        """Request current speed/acceleration config for one stepper."""
+        stepper_id = self._require_id("stepper_id", stepper_id, 1, 4)
+        msg = StepConfigReq()
+        msg.stepper_number = stepper_id
+        self._step_cfg_req_pub.publish(msg)
+
+    def get_step_config(self, stepper_id: int) -> StepConfig | None:
+        """Return cached config for one stepper, or None if it has not been seen yet."""
+        stepper_id = self._require_id("stepper_id", stepper_id, 1, 4)
+        with self._lock:
+            return self._step_config_cache.get(stepper_id)
+
     def get_step_state(self) -> StepStateAll:
         """Return cached stepper motor state."""
         with self._lock:
@@ -887,6 +1233,7 @@ class Robot:
         """
         Non-blocking: current state of button button_id (1–10).
         Reads from the latest cached IOInputState message.
+        Return True if the button is pressed.
         """
         button_id = self._require_id("button_id", button_id, 1, BUTTON_COUNT)
         with self._lock:
@@ -929,6 +1276,11 @@ class Robot:
         limit_id = self._require_id("limit_id", limit_id, 1, LIMIT_COUNT)
         with self._lock:
             return bool((self._limits >> (limit_id - 1)) & 1)
+
+    def get_io_output_state(self) -> IOOutputState:
+        """Return cached LED/NeoPixel output state from /io_output_state."""
+        with self._lock:
+            return self._io_output_state
 
     def was_limit_triggered(self, limit_id: int, consume: bool = True) -> bool:
         """Return True once per rising edge seen on limit_id."""
@@ -1009,51 +1361,26 @@ class Robot:
 
     def get_fused_orientation(self) -> float:
         """
-        Return the current fusion strategy's heading estimate in degrees.
+        Return complementary-filter orientation estimate in degrees.
 
-        Before the magnetometer is calibrated all strategies fall back to
-        raw odometry theta. After calibration the active strategy blends the
-        magnetometer reading with odometry. Use ``set_fusion_strategy()`` to
-        switch between ComplementaryFilter, AdaptiveComplementaryFilter, and
-        HeadingKalmanFilter.
+        Blends the absolute magnetometer heading (corrects long-term drift) with
+        the odometry theta (smooth, short-term accurate). The filter weight
+        ``_fusion_alpha`` (default 0.02) controls how quickly the magnetometer
+        heading pulls the estimate; it only activates once the firmware reports
+        ``mag_calibrated = True``. Before calibration, returns odometry theta.
         """
         with self._lock:
             return math.degrees(self._fused_theta)
 
     def set_fusion_alpha(self, alpha: float) -> None:
         """
-        Set the magnetometer weight on the active ComplementaryFilter (0.0–1.0).
+        Set the magnetometer weight for the complementary filter (0.0–1.0).
 
-        Raises TypeError if a different fusion strategy is active; use
-        set_fusion_strategy() to switch strategies.
+        Lower values trust odometry more (less mag noise, more drift).
+        Higher values correct drift faster but introduce magnetometer noise.
+        Default is 0.02.
         """
-        if not isinstance(self._fusion, ComplementaryFilter):
-            raise TypeError(
-                "set_fusion_alpha() only works with ComplementaryFilter. "
-                "Use set_fusion_strategy() to change strategies."
-            )
-        self._fusion.alpha = max(0.0, min(1.0, float(alpha)))
-
-    def set_fusion_strategy(self, strategy: SensorFusion) -> None:
-        """
-        Replace the active heading fusion strategy.
-
-        Example::
-
-            from robot.sensor_fusion import AdaptiveComplementaryFilter, HeadingKalmanFilter
-
-            # Velocity-adaptive: high mag trust when slow, low when fast
-            robot.set_fusion_strategy(AdaptiveComplementaryFilter())
-
-            # Kalman filter
-            robot.set_fusion_strategy(HeadingKalmanFilter())
-
-            # Back to fixed complementary filter
-            from robot.sensor_fusion import ComplementaryFilter
-            robot.set_fusion_strategy(ComplementaryFilter(alpha=0.02))
-        """
-        with self._lock:
-            self._fusion = strategy
+        self._fusion_alpha = max(0.0, min(1.0, float(alpha)))
 
     # =========================================================================
     # Units
@@ -1071,47 +1398,152 @@ class Robot:
     # =========================================================================
 
     def _start_nav(self, target_fn, blocking: bool, timeout: float):
-        """Cancel any active nav, start a new nav thread."""
-        self.cancel_motion()
+        """Start a new navigation thread. Only one base-motion command may run at a time."""
+        if self.is_moving():
+            raise RuntimeError("Another motion is still running")
+
         self._nav_done.clear()
         self._nav_cancel.clear()
-        self._nav_thread = threading.Thread(target=target_fn, daemon=True)
-        self._nav_thread.start()
-        if blocking:
-            return self._nav_done.wait(timeout=timeout)
-        return MotionHandle(self._nav_done, self._nav_cancel)
 
-    def _nav_to_waypoints(
+        def runner() -> None:
+            try:
+                target_fn()
+            except Exception as exc:
+                self._node.get_logger().error(f"motion thread failed: {exc}")
+                try:
+                    self.stop()
+                except Exception:
+                    pass
+            finally:
+                self._nav_done.set()
+
+        self._nav_thread = threading.Thread(target=runner, daemon=True)
+        self._nav_thread.start()
+        handle = MotionHandle(self._nav_done, self._nav_cancel)
+        if blocking:
+            handle.wait(timeout=timeout)
+        return handle
+
+    def _nav_follow_purepursuit_path(
         self,
         waypoints_mm: list[tuple[float, float]],
         max_vel_mm: float,
+        lookahead_mm: float,
+        advance_radius_mm: float,
+        tolerance_mm: float,
+        max_angular_rad_s: float,
+        update_hz: float = float(DEFAULT_NAV_HZ),
+    ) -> None:
+        """Navigation thread body: pure-pursuit to an ordered list of waypoints (mm)."""
+        from robot.path_planner import PurePursuitPlanner
+
+        planner = PurePursuitPlanner(
+            lookahead_dist=lookahead_mm,
+            max_angular=max_angular_rad_s,
+            goal_tolerance=tolerance_mm,
+        )
+        self._nav_follow_path(
+            waypoints_mm,
+            planner,
+            max_vel_mm,
+            advance_radius_mm,
+            tolerance_mm,
+            update_hz=update_hz,
+        )
+
+    def _nav_follow_apf_path(
+        self,
+        waypoints_mm: list[tuple[float, float]],
+        max_vel_mm: float,
+        lookahead_mm: float,
+        advance_radius_mm: float,
+        tolerance_mm: float,
+        repulsion_range_mm: float,
+        max_angular_rad_s: float,
+        repulsion_gain: float,
+        update_hz: float = float(DEFAULT_NAV_HZ),
+    ) -> None:
+        """Navigation thread body: APF path following with robot-frame obstacles."""
+        from robot.path_planner import APFPlanner
+
+        planner = APFPlanner(
+            lookahead_dist=lookahead_mm,
+            max_linear=max_vel_mm,
+            max_angular=max_angular_rad_s,
+            repulsion_gain=repulsion_gain,
+            repulsion_range=repulsion_range_mm,
+            goal_tolerance=tolerance_mm,
+            obstacle_provider=self._get_obstacles_mm,
+        )
+        self._nav_follow_path(
+            waypoints_mm,
+            planner,
+            max_vel_mm,
+            advance_radius_mm,
+            tolerance_mm,
+            update_hz=update_hz,
+        )
+
+    def _nav_follow_path(
+        self,
+        waypoints_mm: list[tuple[float, float]],
+        planner,
+        max_vel_mm: float,
+        advance_radius_mm: float,
         tolerance_mm: float,
         update_hz: float = float(DEFAULT_NAV_HZ),
     ) -> None:
-        """Navigation thread body: pure-pursuit to a list of waypoints (mm)."""
-        from robot.path_planner import PurePursuitPlanner
-        planner = PurePursuitPlanner(lookahead_dist=max(tolerance_mm * 2, 100))
+        """Shared path-following loop for pure pursuit and APF planners."""
+        remaining_path = list(waypoints_mm)
         dt = 1.0 / update_hz
 
         while not self._nav_cancel.is_set():
-            x, y, theta_rad = self._get_pose_mm()
+            x_mm, y_mm, theta_rad = self._get_pose_mm()
+            remaining_path = self._advance_remaining_path(
+                remaining_path,
+                x_mm,
+                y_mm,
+                advance_radius_mm,
+            )
 
-            # Remove waypoints already within tolerance
-            while waypoints_mm and _dist2d(x, y, *waypoints_mm[0]) < tolerance_mm:
-                waypoints_mm.pop(0)
-
-            if not waypoints_mm:
+            goal_x_mm, goal_y_mm = remaining_path[0]
+            if len(remaining_path) == 1 and _dist2d(x_mm, y_mm, goal_x_mm, goal_y_mm) <= tolerance_mm:
                 self.stop()
-                self._nav_done.set()
                 return
 
-            linear_mm, angular_rad = planner.compute_velocity(
-                (x, y, theta_rad), waypoints_mm, max_vel_mm
+            linear_mm, angular_rad_s = planner.compute_velocity(
+                (x_mm, y_mm, theta_rad),
+                remaining_path,
+                max_vel_mm,
             )
-            self._send_body_velocity_mm(linear_mm, angular_rad)
-            time.sleep(dt)
+            self._send_body_velocity_mm(linear_mm, angular_rad_s)
+            if not self._sleep_with_cancel(dt):
+                break
 
         self.stop()
+
+    @staticmethod
+    def _advance_remaining_path(
+        remaining_path: list[tuple[float, float]],
+        x_mm: float,
+        y_mm: float,
+        advance_radius_mm: float,
+    ) -> list[tuple[float, float]]:
+        """
+        Advance path progress in route order.
+
+        Intermediate waypoints are dropped once the robot gets within the
+        advance radius of the current front waypoint. The final waypoint is
+        never dropped here; completion is handled separately so looped or
+        overlapping paths do not finish early just because the robot passes
+        near the final goal before traversing the whole route.
+        """
+        while len(remaining_path) > 1:
+            next_x_mm, next_y_mm = remaining_path[0]
+            if _dist2d(x_mm, y_mm, next_x_mm, next_y_mm) > advance_radius_mm:
+                break
+            remaining_path.pop(0)
+        return remaining_path
 
     def _turn_to_heading(
         self,
@@ -1127,12 +1559,20 @@ class Robot:
             error = _wrap_angle(target_rad - theta_rad)
             if abs(error) < tolerance_rad:
                 self.stop()
-                self._nav_done.set()
                 return
             angular = max(-max_angular_rad, min(max_angular_rad, error * 3.0))
             self._send_body_velocity_mm(0.0, angular)
-            time.sleep(dt)
+            if not self._sleep_with_cancel(dt):
+                break
         self.stop()
+
+    def _sleep_with_cancel(self, seconds: float) -> bool:
+        """
+        Wait for up to seconds, but wake early if the active base motion is cancelled.
+
+        Returns True when the full interval elapsed, False when cancel was requested.
+        """
+        return not self._nav_cancel.wait(timeout=seconds)
 
     # =========================================================================
     # Internal — blocking waits for actuator completion
@@ -1188,6 +1628,28 @@ class Robot:
         """Return (x_mm, y_mm, theta_rad) without unit conversion."""
         with self._lock:
             return self._pose
+
+    def _get_obstacles_mm(self) -> list[tuple[float, float]]:
+        """Return cached and provider-supplied APF obstacles in robot-frame millimeters."""
+        with self._lock:
+            cached = list(self._obstacles_mm)
+            provider = self._obstacle_provider
+
+        dynamic: list[tuple[float, float]] = []
+        if provider is not None:
+            try:
+                provided = provider() or []
+                dynamic = [
+                    (
+                        self._require_finite_float("obstacle_x_mm", obs_x),
+                        self._require_finite_float("obstacle_y_mm", obs_y),
+                    )
+                    for obs_x, obs_y in provided
+                ]
+            except Exception as exc:
+                self._node.get_logger().error(f"obstacle provider failed: {exc}")
+
+        return cached + dynamic
 
     @staticmethod
     def _require_id(name: str, value: int, low: int, high: int) -> int:

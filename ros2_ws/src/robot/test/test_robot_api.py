@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import math
 import sys
+import threading
 import types
 import unittest
 from unittest import mock
@@ -19,6 +20,9 @@ class FakePublisher:
 
 
 class FakeLogger:
+    def info(self, _msg: str) -> None:
+        pass
+
     def error(self, _msg: str) -> None:
         pass
 
@@ -84,6 +88,7 @@ def _install_fake_robot_dependencies() -> None:
     for name in [
         "DCEnable",
         "DCHome",
+        "DCPid",
         "DCPidReq",
         "DCPidSet",
         "DCResetPosition",
@@ -92,6 +97,7 @@ def _install_fake_robot_dependencies() -> None:
         "DCSetVelocity",
         "DCStateAll",
         "IOInputState",
+        "IOOutputState",
         "IOSetLed",
         "IOSetNeopixel",
         "SensorImu",
@@ -99,6 +105,8 @@ def _install_fake_robot_dependencies() -> None:
         "ServoEnable",
         "ServoSet",
         "ServoStateAll",
+        "StepConfig",
+        "StepConfigReq",
         "StepConfigSet",
         "StepEnable",
         "StepHome",
@@ -108,6 +116,9 @@ def _install_fake_robot_dependencies() -> None:
         "SysOdomParamRsp",
         "SysOdomParamSet",
         "SysOdomReset",
+        "SystemConfig",
+        "SystemDiag",
+        "SystemInfo",
         "SystemPower",
         "SystemState",
     ]:
@@ -211,11 +222,38 @@ class RobotApiTests(unittest.TestCase):
         self.assertEqual(msg.right_motor_number, 2)
         self.assertTrue(msg.right_motor_dir_inverted)
 
+    def test_set_odometry_parameters_uses_current_unit_for_geometry(self) -> None:
+        self.robot.set_unit(self.robot_module.Unit.INCH)
+
+        self.robot.set_odometry_parameters(
+            wheel_diameter=3.0,
+            wheel_base=12.0,
+        )
+
+        msg = self.node.publishers["/sys_odom_param_set"].published[-1]
+        self.assertAlmostEqual(msg.wheel_diameter_mm, 76.2, places=6)
+        self.assertAlmostEqual(msg.wheel_base_mm, 304.8, places=6)
+        self.assertAlmostEqual(self.robot.get_odometry_parameters()["wheel_diameter_mm"], 76.2, places=6)
+        self.assertAlmostEqual(self.robot.get_odometry_parameters()["wheel_base_mm"], 304.8, places=6)
+
     def test_request_odometry_parameters_publishes_query(self) -> None:
         self.robot.request_odometry_parameters()
 
         msg = self.node.publishers["/sys_odom_param_req"].published[-1]
         self.assertEqual(msg.target, 0xFF)
+
+    def test_system_info_diag_and_config_are_cached(self) -> None:
+        info = types.SimpleNamespace(firmware_major=1, dc_motor_count=4)
+        config = types.SimpleNamespace(motor_dir_mask=3, neopixel_count=4)
+        diag = types.SimpleNamespace(free_sram=1234, tx_dropped_frames=5)
+
+        self.robot._on_sys_info(info)
+        self.robot._on_sys_config(config)
+        self.robot._on_sys_diag(diag)
+
+        self.assertIs(self.robot.get_system_info(), info)
+        self.assertIs(self.robot.get_system_config(), config)
+        self.assertIs(self.robot.get_system_diag(), diag)
 
     def test_odom_param_response_updates_local_snapshot(self) -> None:
         msg = types.SimpleNamespace(
@@ -247,6 +285,38 @@ class RobotApiTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be different"):
             self.robot.set_odometry_parameters(left_motor_id=2, right_motor_id=2)
 
+    def test_request_pid_and_get_pid_cache(self) -> None:
+        self.robot.request_pid(2, self.hardware_map.DCPidLoop.VELOCITY)
+        req = self.node.publishers["/dc_pid_req"].published[-1]
+        self.assertEqual(req.motor_number, 2)
+        self.assertEqual(req.loop_type, int(self.hardware_map.DCPidLoop.VELOCITY))
+
+        rsp = types.SimpleNamespace(
+            motor_number=2,
+            loop_type=int(self.hardware_map.DCPidLoop.VELOCITY),
+            kp=1.0,
+            ki=2.0,
+            kd=3.0,
+            max_output=255.0,
+            max_integral=1000.0,
+        )
+        self.robot._on_dc_pid(rsp)
+        self.assertIs(self.robot.get_pid(2, self.hardware_map.DCPidLoop.VELOCITY), rsp)
+
+    def test_request_step_config_and_get_step_config_cache(self) -> None:
+        self.robot.request_step_config(3)
+        req = self.node.publishers["/step_config_req"].published[-1]
+        self.assertEqual(req.stepper_number, 3)
+
+        rsp = types.SimpleNamespace(stepper_number=3, max_velocity=800, acceleration=1200)
+        self.robot._on_step_config(rsp)
+        self.assertIs(self.robot.get_step_config(3), rsp)
+
+    def test_get_io_output_state_returns_cached_message(self) -> None:
+        msg = types.SimpleNamespace(led_brightness=[0, 1, 2, 3, 4], neo_pixel_count=2)
+        self.robot._on_io_output(msg)
+        self.assertIs(self.robot.get_io_output_state(), msg)
+
     def test_zero_brightness_defaults_to_led_off_mode(self) -> None:
         self.robot.set_led(1, 0)
         msg = self.node.publishers["/io_set_led"].published[-1]
@@ -259,6 +329,231 @@ class RobotApiTests(unittest.TestCase):
         msg = self.node.publishers["/io_set_led"].published[-1]
         self.assertEqual(msg.mode, 1)
         self.assertEqual(msg.brightness, 255)
+
+    def test_motion_handle_reports_finished(self) -> None:
+        finished = threading.Event()
+        cancel = threading.Event()
+        handle = self.robot_module.MotionHandle(finished, cancel)
+
+        self.assertFalse(handle.is_finished())
+        self.assertFalse(handle.is_done())
+
+        finished.set()
+
+        self.assertTrue(handle.is_finished())
+        self.assertTrue(handle.is_done())
+
+    def test_blocking_navigation_returns_finished_handle(self) -> None:
+        handle = self.robot._start_nav(lambda: None, blocking=True, timeout=0.1)
+
+        self.assertIsInstance(handle, self.robot_module.MotionHandle)
+        self.assertTrue(handle.is_finished())
+
+    def test_purepursuit_follow_path_requires_waypoints(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            self.robot.purepursuit_follow_path(
+                [],
+                velocity=100.0,
+                lookahead=100.0,
+                tolerance=20.0,
+                blocking=False,
+            )
+
+    def test_purepursuit_follow_path_defaults_advance_radius_to_tolerance(self) -> None:
+        with mock.patch.object(self.robot, "_nav_follow_purepursuit_path") as nav_follow, \
+             mock.patch.object(
+                 self.robot,
+                 "_start_nav",
+                 side_effect=lambda target, blocking, timeout: (target(), "handle")[1],
+             ):
+            result = self.robot.purepursuit_follow_path(
+                [(0.0, 0.0), (100.0, 0.0)],
+                velocity=100.0,
+                lookahead=100.0,
+                tolerance=20.0,
+                blocking=False,
+            )
+
+        self.assertEqual(result, "handle")
+        nav_follow.assert_called_once_with(
+            [(0.0, 0.0), (100.0, 0.0)],
+            100.0,
+            100.0,
+            20.0,
+            20.0,
+            1.0,
+        )
+
+    def test_purepursuit_follow_path_accepts_explicit_advance_radius(self) -> None:
+        with mock.patch.object(self.robot, "_nav_follow_purepursuit_path") as nav_follow, \
+             mock.patch.object(
+                 self.robot,
+                 "_start_nav",
+                 side_effect=lambda target, blocking, timeout: (target(), "handle")[1],
+             ):
+            self.robot.purepursuit_follow_path(
+                [(0.0, 0.0), (100.0, 0.0)],
+                velocity=100.0,
+                lookahead=100.0,
+                tolerance=20.0,
+                advance_radius=35.0,
+                blocking=False,
+            )
+
+        nav_follow.assert_called_once_with(
+            [(0.0, 0.0), (100.0, 0.0)],
+            100.0,
+            100.0,
+            35.0,
+            20.0,
+            1.0,
+        )
+
+    def test_apf_follow_path_requires_waypoints(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            self.robot.apf_follow_path(
+                [],
+                velocity=100.0,
+                lookahead=100.0,
+                tolerance=20.0,
+                repulsion_range=150.0,
+                blocking=False,
+            )
+
+    def test_apf_follow_path_defaults_advance_radius_to_tolerance(self) -> None:
+        with mock.patch.object(self.robot, "_nav_follow_apf_path") as nav_follow, \
+             mock.patch.object(
+                 self.robot,
+                 "_start_nav",
+                 side_effect=lambda target, blocking, timeout: (target(), "handle")[1],
+             ):
+            result = self.robot.apf_follow_path(
+                [(0.0, 0.0), (100.0, 0.0)],
+                velocity=100.0,
+                lookahead=100.0,
+                tolerance=20.0,
+                repulsion_range=150.0,
+                blocking=False,
+            )
+
+        self.assertEqual(result, "handle")
+        nav_follow.assert_called_once_with(
+            [(0.0, 0.0), (100.0, 0.0)],
+            100.0,
+            100.0,
+            20.0,
+            20.0,
+            150.0,
+            1.0,
+            500.0,
+        )
+
+    def test_unit_dependent_navigation_parameters_must_be_explicit(self) -> None:
+        with self.assertRaises(TypeError):
+            self.robot.move_to(100.0, 0.0, 100.0)
+
+        with self.assertRaises(TypeError):
+            self.robot.move_by(100.0, 0.0, 100.0)
+
+        with self.assertRaises(TypeError):
+            self.robot.purepursuit_follow_path([(0.0, 0.0), (100.0, 0.0)], velocity=100.0)
+
+    def test_purepursuit_follow_path_rejects_overlapping_motion(self) -> None:
+        self.robot._nav_thread = types.SimpleNamespace(is_alive=lambda: True)
+
+        with self.assertRaisesRegex(RuntimeError, "Another motion is still running"):
+            self.robot.purepursuit_follow_path(
+                [(0.0, 0.0), (100.0, 0.0)],
+                velocity=100.0,
+                lookahead=100.0,
+                tolerance=20.0,
+                blocking=False,
+            )
+
+    def test_apf_follow_path_rejects_overlapping_motion(self) -> None:
+        self.robot._nav_thread = types.SimpleNamespace(is_alive=lambda: True)
+
+        with self.assertRaisesRegex(RuntimeError, "Another motion is still running"):
+            self.robot.apf_follow_path(
+                [(0.0, 0.0), (100.0, 0.0)],
+                velocity=100.0,
+                lookahead=100.0,
+                tolerance=20.0,
+                repulsion_range=150.0,
+                blocking=False,
+            )
+
+    def test_move_forward_uses_current_heading(self) -> None:
+        self.robot._pose = (10.0, 20.0, 0.0)
+
+        with mock.patch.object(self.robot, "move_to", return_value="ok") as move_to:
+            result = self.robot.move_forward(100.0, 50.0, tolerance=10.0, blocking=False)
+
+        self.assertEqual(result, "ok")
+        move_to.assert_called_once_with(
+            110.0,
+            20.0,
+            50.0,
+            tolerance=10.0,
+            blocking=False,
+            timeout=None,
+        )
+
+    def test_move_backward_uses_current_heading(self) -> None:
+        self.robot._pose = (10.0, 20.0, self.robot_module.math.pi / 2.0)
+
+        with mock.patch.object(self.robot, "move_to", return_value="ok") as move_to:
+            result = self.robot.move_backward(100.0, 50.0, tolerance=10.0, blocking=True)
+
+        self.assertEqual(result, "ok")
+        move_to.assert_called_once()
+        x_arg, y_arg, velocity_arg = move_to.call_args.args[:3]
+        self.assertAlmostEqual(x_arg, 10.0, places=6)
+        self.assertAlmostEqual(y_arg, -80.0, places=6)
+        self.assertEqual(velocity_arg, 50.0)
+        self.assertEqual(move_to.call_args.kwargs["tolerance"], 10.0)
+        self.assertTrue(move_to.call_args.kwargs["blocking"])
+
+    def test_set_obstacles_converts_current_unit_to_mm(self) -> None:
+        self.robot.set_unit(self.robot_module.Unit.INCH)
+
+        self.robot.set_obstacles([(1.0, 2.0)])
+
+        self.assertEqual(self.robot._get_obstacles_mm(), [(25.4, 50.8)])
+        self.assertEqual(self.robot.get_obstacles(), [(1.0, 2.0)])
+
+    def test_obstacle_provider_is_combined_with_cached_obstacles(self) -> None:
+        self.robot.set_obstacles([(10.0, 20.0)])
+        self.robot.set_obstacle_provider(lambda: [(30.0, -40.0)])
+
+        self.assertEqual(self.robot._get_obstacles_mm(), [(10.0, 20.0), (30.0, -40.0)])
+        self.assertEqual(self.robot.get_obstacles(), [(10.0, 20.0), (30.0, -40.0)])
+
+    def test_path_progress_does_not_finish_early_on_closed_loop(self) -> None:
+        remaining = [
+            (0.0, 0.0),
+            (0.0, 100.0),
+            (100.0, 100.0),
+            (100.0, 0.0),
+            (0.0, 0.0),
+        ]
+
+        advanced = self.robot._advance_remaining_path(
+            remaining,
+            x_mm=0.0,
+            y_mm=0.0,
+            advance_radius_mm=20.0,
+        )
+
+        self.assertEqual(
+            advanced,
+            [
+                (0.0, 100.0),
+                (100.0, 100.0),
+                (100.0, 0.0),
+                (0.0, 0.0),
+            ],
+        )
 
     def test_led_mode_enum_matches_firmware_contract(self) -> None:
         self.robot.set_led(1, 128, mode=self.hardware_map.LEDMode.BREATHE)
@@ -291,6 +586,14 @@ class RobotApiTests(unittest.TestCase):
         self.assertTrue(all(msg.target_ticks == 0 for msg in velocity_msgs))
         self.assertEqual([msg.motor_number for msg in disable_msgs], [1, 2])
         self.assertTrue(all(msg.mode == int(self.hardware_map.DCMotorMode.DISABLED) for msg in disable_msgs))
+
+    def test_shutdown_requests_idle_when_firmware_was_running(self) -> None:
+        self.robot._sys_state = int(self.robot_module.FirmwareState.RUNNING)
+
+        with mock.patch.object(self.robot, "set_state", return_value=True) as set_state:
+            self.robot.shutdown()
+
+        set_state.assert_called_once_with(self.robot_module.FirmwareState.IDLE, timeout=1.0)
 
     def test_button_edges_are_latched_in_subscription_callback(self) -> None:
         first = self.robot_module.IOInputState()
@@ -373,9 +676,9 @@ class RobotApiTests(unittest.TestCase):
 
     def test_set_fusion_alpha_is_clamped(self) -> None:
         self.robot.set_fusion_alpha(2.0)
-        self.assertEqual(self.robot._fusion.alpha, 1.0)
+        self.assertEqual(self.robot._fusion_alpha, 1.0)
         self.robot.set_fusion_alpha(-1.0)
-        self.assertEqual(self.robot._fusion.alpha, 0.0)
+        self.assertEqual(self.robot._fusion_alpha, 0.0)
 
 
 if __name__ == "__main__":

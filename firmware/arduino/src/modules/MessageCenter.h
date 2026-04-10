@@ -62,6 +62,7 @@
 // Prefer smaller telemetry frames so lower-priority updates defer to later
 // UART task ticks instead of bunching into one larger burst.
 #define TX_FRAME_SOFT_LIMIT 192
+#define TX_QUEUE_DEPTH 2
 
 // ============================================================================
 // MESSAGE CENTER CLASS (Static)
@@ -217,7 +218,7 @@ public:
     static uint16_t getTlvErrorCount()  { return tlvErrorCount_; }
     static uint16_t getOversizeErrorCount() { return oversizeErrorCount_; }
     static uint32_t getTxDroppedFrames(){ return txDroppedFrames_; }
-    static uint16_t getTxPendingBytes() { return (txPendingOffset_ < txPendingLen_) ? (uint16_t)(txPendingLen_ - txPendingOffset_) : 0; }
+    static uint16_t getTxPendingBytes();
     static uint32_t getTimeSinceRxByte() { return millis() - lastRxByteMs_; }
     static uint8_t getFaultLatchFlags() { return faultLatchFlags_; }
     static uint16_t getHeartbeatTimeoutMs() { return heartbeatTimeoutMs_; }
@@ -234,14 +235,16 @@ private:
     // ---- TLV codec (owned directly, no UARTDriver wrapper) ----
     static struct TlvEncodeDescriptor encodeDesc_;
     static struct TlvDecodeDescriptor decodeDesc_;
-    static uint8_t txStorage_[TX_BUFFER_SIZE];
+    static uint8_t txStorage_[TX_QUEUE_DEPTH][TX_BUFFER_SIZE];
     static uint8_t rxStorage_[RX_BUFFER_SIZE];
     static struct TlvHeader decodeHeaders_[TLVCODEC_TLV_SLOTS_FOR_FRAME_BYTES(RX_BUFFER_SIZE)];
     static uint8_t *decodeData_[TLVCODEC_TLV_SLOTS_FOR_FRAME_BYTES(RX_BUFFER_SIZE)];
-    static uint8_t *txBuffer_;                // Alias of txStorage_ for drainTx()
-    static uint16_t txPendingLen_;            // Bytes queued in txBuffer_
-    static uint16_t txPendingOffset_;         // Next queued TX byte to send
-    static uint32_t txDroppedFrames_;         // Frames skipped because prior TX still draining
+    static uint16_t txQueuedLen_[TX_QUEUE_DEPTH];
+    static uint16_t txQueuedOffset_[TX_QUEUE_DEPTH];
+    static uint8_t txHead_;
+    static uint8_t txTail_;
+    static uint8_t txQueuedFrames_;
+    static uint32_t txDroppedFrames_;         // TX queue-full retry events (not persistent backlog bytes)
 
     // ---- Liveness tracking ----
     static uint32_t lastHeartbeatMs_;    // millis() of last received TLV
@@ -353,7 +356,7 @@ private:
      *
      * No-ops if no TLVs have been appended since the last beginFrame().
      */
-    static void sendFrame();
+    static bool sendFrame();
 
     /**
      * @brief TLV decode callback — called synchronously by decode() for each complete frame
@@ -449,8 +452,11 @@ private:
     /** @brief Append IMU quaternion and raw sensor data (52 bytes payload) */
     static void sendSensorIMU();
 
-    /** @brief Append wheel odometry kinematics (28 bytes payload) */
-    static void sendSensorKinematics();
+    /**
+     * @brief Append wheel odometry kinematics (28 bytes payload)
+     * @return True if the TLV was appended to the current frame.
+     */
+    static bool sendSensorKinematics();
 
     /** @brief Append live system state */
     static void sendSysState();

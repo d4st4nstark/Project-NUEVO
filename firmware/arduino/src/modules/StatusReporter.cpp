@@ -612,7 +612,7 @@ void StatusReporter::emitChunk() {
                                (unsigned long)s.crossRoundDelta);
             break;
         case 8:
-            DebugLog::printf_P(PSTR("Memory: RAM=%u B | TxDrop=%lu | DbgDrop=%u | LoopGap=%u/%uus\n"),
+            DebugLog::printf_P(PSTR("Memory: RAM=%u B | TxQFull=%lu | DbgDrop=%u | LoopGap=%u/%uus\n"),
                                s.freeRam,
                                (unsigned long)s.txDroppedFrames,
                                s.debugDroppedBytes,
