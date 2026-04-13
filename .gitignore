@@ -199,6 +199,11 @@ get-docker.sh
 *.tar.gz.tmp
 
 # ============================================
+# Lab Documentation (generated/student-facing, not tracked)
+# ============================================
+ros2_ws/src/lab_docs/
+
+# ============================================
 # Project Specific
 # ============================================
 # Test data and logs
