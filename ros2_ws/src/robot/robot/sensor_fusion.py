@@ -8,8 +8,10 @@ All strategies share the same interface::
 Arguments
 ---------
 odom_theta   : heading from wheel odometry (radians)
-mag_heading  : absolute heading from magnetometer (radians), or None when
-               the magnetometer is not yet calibrated
+mag_heading  : absolute heading from the AHRS (radians), or None when the
+               AHRS is not yet calibrated.  Despite the parameter name, this
+               is derived from the Madgwick AHRS quaternion output on the
+               /sensor_imu topic — not raw magnetometer data.
 linear_vel   : magnitude of linear body velocity (mm/s)
 angular_vel  : signed angular velocity from odometry (rad/s)
 
@@ -55,7 +57,7 @@ class ComplementaryFilter(SensorFusion):
     """
     Fixed-weight complementary filter.
 
-    Blends the magnetometer heading (absolute but noisy) with the odometry
+    Blends the AHRS heading (absolute but noisy) with the odometry
     heading (smooth but drifts) using a constant weight::
 
         fused = odom_theta + alpha * wrap(mag_heading - odom_theta)
@@ -63,7 +65,7 @@ class ComplementaryFilter(SensorFusion):
     Parameters
     ----------
     alpha : float, 0.0–1.0
-        Magnetometer weight.  0 = pure odometry, 1 = pure magnetometer.
+        AHRS heading weight.  0 = pure odometry, 1 = pure AHRS.
         Default 0.02 gives gentle long-term drift correction.
     """
 
@@ -90,8 +92,8 @@ class AdaptiveComplementaryFilter(SensorFusion):
     """
     Velocity-adaptive complementary filter.
 
-    The magnetometer weight decreases as the robot moves faster.  When the
-    robot is nearly stationary, the magnetometer is very reliable so the
+    The AHRS heading weight decreases as the robot moves faster.  When the
+    robot is nearly stationary, the AHRS heading is very reliable so the
     weight rises toward ``alpha_max``.  At speed, odometry is more
     trustworthy short-term, so the weight drops toward ``alpha_min``::
 
@@ -100,18 +102,18 @@ class AdaptiveComplementaryFilter(SensorFusion):
 
     Intuition
     ---------
-    * Low linear *and* angular velocity  → alpha ≈ alpha_max  (trust mag)
+    * Low linear *and* angular velocity  → alpha ≈ alpha_max  (trust AHRS)
     * High linear *or* angular velocity  → alpha ≈ alpha_min  (trust odom)
-    * linear_scale / angular_scale set the velocity at which the extra mag
+    * linear_scale / angular_scale set the velocity at which the extra AHRS
       weight decays to exp(−1) ≈ 37 % of its maximum.
 
     Parameters
     ----------
     alpha_min     : weight floor at high speed (default 0.005)
     alpha_max     : weight ceiling at rest (default 0.10)
-    linear_scale  : linear speed (mm/s) where extra mag weight is ≈ 37 %
+    linear_scale  : linear speed (mm/s) where extra AHRS weight is ≈ 37 %
                     (default 50.0)
-    angular_scale : angular speed (rad/s) where extra mag weight is ≈ 37 %
+    angular_scale : angular speed (rad/s) where extra AHRS weight is ≈ 37 %
                     (default 0.3)
     """
 
@@ -153,7 +155,7 @@ class HeadingKalmanFilter(SensorFusion):
     """
     1-D Kalman filter for robot heading.
 
-    The odometry heading acts as the process prediction.  The magnetometer
+    The odometry heading acts as the process prediction.  The AHRS heading
     provides noisy absolute measurements to correct accumulated drift.
 
     Equations
@@ -165,8 +167,8 @@ class HeadingKalmanFilter(SensorFusion):
                 θ̂    = θ̂⁻ + K · wrap(mag_heading − θ̂⁻)
                 P    = (1 − K) · P⁻
 
-    When the magnetometer is not yet calibrated only the predict step runs,
-    so the estimate tracks odometry exactly until the first mag fix.
+    When the AHRS is not yet calibrated only the predict step runs,
+    so the estimate tracks odometry exactly until the first AHRS fix.
 
     Parameters
     ----------
@@ -174,11 +176,11 @@ class HeadingKalmanFilter(SensorFusion):
                         Larger = trust odometry less and correct drift
                         faster, but the estimate becomes noisier.
                         Default 1e-4.
-    measurement_noise : R — magnetometer heading variance (rad²).
-                        Larger = trust mag less, smoother but slower to
+    measurement_noise : R — AHRS heading variance (rad²).
+                        Larger = trust AHRS less, smoother but slower to
                         correct drift.  Default 0.05.
     initial_variance  : P₀ — starting error covariance.  High default (1.0)
-                        means the first magnetometer fix is trusted strongly.
+                        means the first AHRS fix is trusted strongly.
     """
 
     def __init__(
@@ -216,7 +218,7 @@ class HeadingKalmanFilter(SensorFusion):
             self._P = P_pred
             return theta_pred
 
-        # Update: fuse with magnetometer measurement
+        # Update: fuse with AHRS measurement
         K = P_pred / (P_pred + self.R)
         self._theta_est = theta_pred + K * _wrap(mag_heading - theta_pred)
         self._P = (1.0 - K) * P_pred

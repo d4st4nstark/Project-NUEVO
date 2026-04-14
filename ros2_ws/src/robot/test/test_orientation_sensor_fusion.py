@@ -152,16 +152,16 @@ class OrientationSensorFusionTests(unittest.TestCase):
     # Initial state
     # ------------------------------------------------------------------
 
-    def test_initial_fused_orientation_is_zero_degrees(self) -> None:
-        # No messages received yet — default fused_theta is 0.0 rad.
-        self.assertAlmostEqual(self.robot.get_fused_orientation(), 0.0, places=6)
+    def test_initial_fused_orientation_is_initial_theta_degrees(self) -> None:
+        # No messages received yet — default fused_theta is INITIAL_THETA_DEG (90°).
+        self.assertAlmostEqual(self.robot.get_fused_orientation(), 90.0, places=6)
 
     # ------------------------------------------------------------------
-    # No mag calibration → pure odometry pass-through
+    # No AHRS calibration → pure odometry pass-through
     # ------------------------------------------------------------------
 
-    def test_uncalibrated_mag_does_not_affect_fused_theta(self) -> None:
-        # Deliver an IMU message with mag pointing north but uncalibrated.
+    def test_uncalibrated_ahrs_does_not_affect_fused_theta(self) -> None:
+        # Deliver an IMU message with AHRS pointing north but uncalibrated.
         self.robot._on_imu(_make_imu(self.mod, mag_calibrated=False, mag_x=1.0, mag_y=0.0))
         # Kinematics says robot is facing 45°.
         self.robot._on_kinematics(_make_kin(self.mod, theta=math.radians(45.0)))
@@ -169,16 +169,16 @@ class OrientationSensorFusionTests(unittest.TestCase):
         self.assertAlmostEqual(self.robot.get_fused_orientation(), 45.0, places=6)
 
     def test_no_imu_message_fused_theta_equals_odometry(self) -> None:
-        # Without any IMU message at all, _mag_heading remains None.
+        # Without any IMU message at all, _ahrs_heading remains None.
         self.robot._on_kinematics(_make_kin(self.mod, theta=math.radians(30.0)))
 
         self.assertAlmostEqual(self.robot.get_fused_orientation(), 30.0, places=6)
 
     # ------------------------------------------------------------------
-    # Mag heading extraction from atan2(mag_y, mag_x)
+    # AHRS heading extraction from atan2(mag_y, mag_x)
     # ------------------------------------------------------------------
 
-    def test_mag_heading_east_is_zero(self) -> None:
+    def test_ahrs_heading_east_is_zero(self) -> None:
         # mag_x > 0, mag_y == 0 → atan2(0, 1) = 0 rad
         self.robot._on_imu(_make_imu(self.mod, mag_calibrated=True, mag_x=1.0, mag_y=0.0))
         self.robot.set_fusion_alpha(1.0)
@@ -186,7 +186,7 @@ class OrientationSensorFusionTests(unittest.TestCase):
 
         self.assertAlmostEqual(self.robot.get_fused_orientation(), 0.0, places=6)
 
-    def test_mag_heading_north_is_90_degrees(self) -> None:
+    def test_ahrs_heading_north_is_90_degrees(self) -> None:
         # mag_x == 0, mag_y > 0 → atan2(1, 0) = π/2 rad = 90°
         self.robot._on_imu(_make_imu(self.mod, mag_calibrated=True, mag_x=0.0, mag_y=1.0))
         self.robot.set_fusion_alpha(1.0)
@@ -194,7 +194,7 @@ class OrientationSensorFusionTests(unittest.TestCase):
 
         self.assertAlmostEqual(self.robot.get_fused_orientation(), 90.0, places=6)
 
-    def test_mag_heading_west_is_180_degrees(self) -> None:
+    def test_ahrs_heading_west_is_180_degrees(self) -> None:
         # mag_x < 0, mag_y == 0 → atan2(0, -1) = π rad = 180°
         self.robot._on_imu(_make_imu(self.mod, mag_calibrated=True, mag_x=-1.0, mag_y=0.0))
         self.robot.set_fusion_alpha(1.0)
@@ -205,7 +205,7 @@ class OrientationSensorFusionTests(unittest.TestCase):
             abs(self.robot.get_fused_orientation()), 180.0, places=6
         )
 
-    def test_mag_heading_south_is_minus_90_degrees(self) -> None:
+    def test_ahrs_heading_south_is_minus_90_degrees(self) -> None:
         # mag_x == 0, mag_y < 0 → atan2(-1, 0) = -π/2 rad = -90°
         self.robot._on_imu(_make_imu(self.mod, mag_calibrated=True, mag_x=0.0, mag_y=-1.0))
         self.robot.set_fusion_alpha(1.0)
@@ -218,7 +218,7 @@ class OrientationSensorFusionTests(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_alpha_zero_means_pure_odometry(self) -> None:
-        # With alpha = 0 the mag heading has no influence at all.
+        # With alpha = 0 the AHRS heading has no influence at all.
         self.robot.set_fusion_alpha(0.0)
         self.robot._on_imu(_make_imu(self.mod, mag_calibrated=True, mag_x=0.0, mag_y=1.0))
         odom_theta = math.radians(30.0)
@@ -228,8 +228,8 @@ class OrientationSensorFusionTests(unittest.TestCase):
             self.robot.get_fused_orientation(), math.degrees(odom_theta), places=6
         )
 
-    def test_alpha_one_means_pure_magnetometer(self) -> None:
-        # With alpha = 1 the result must equal the mag heading regardless of odometry.
+    def test_alpha_one_means_pure_ahrs(self) -> None:
+        # With alpha = 1 the result must equal the AHRS heading regardless of odometry.
         self.robot.set_fusion_alpha(1.0)
         mag_heading = math.atan2(1.0, 0.0)  # π/2
         self.robot._on_imu(_make_imu(self.mod, mag_calibrated=True, mag_x=0.0, mag_y=1.0))
@@ -260,8 +260,8 @@ class OrientationSensorFusionTests(unittest.TestCase):
     # Angle-wrap robustness (crossing ±π boundary)
     # ------------------------------------------------------------------
 
-    def test_angle_wrap_mag_near_plus_pi_odom_near_minus_pi(self) -> None:
-        # mag heading ≈ +175°, odometry ≈ -175°: naive subtraction gives ~350°,
+    def test_angle_wrap_ahrs_near_plus_pi_odom_near_minus_pi(self) -> None:
+        # AHRS heading ≈ +175°, odometry ≈ -175°: naive subtraction gives ~350°,
         # but the atan2 wrapping must produce a short ~10° correction.
         alpha = 0.5
         self.robot.set_fusion_alpha(alpha)
@@ -289,7 +289,7 @@ class OrientationSensorFusionTests(unittest.TestCase):
         correction = self.robot.get_fused_orientation() - odom_deg
         self.assertLess(abs(correction), 20.0)
 
-    def test_angle_wrap_mag_near_minus_pi_odom_near_plus_pi(self) -> None:
+    def test_angle_wrap_ahrs_near_minus_pi_odom_near_plus_pi(self) -> None:
         alpha = 0.5
         self.robot.set_fusion_alpha(alpha)
 
@@ -313,7 +313,7 @@ class OrientationSensorFusionTests(unittest.TestCase):
         self.assertLess(abs(correction), 20.0)
 
     def test_no_wrap_artifact_when_headings_agree(self) -> None:
-        # When mag and odometry agree, the correction must be zero.
+        # When AHRS and odometry agree, the correction must be zero.
         alpha = 0.5
         self.robot.set_fusion_alpha(alpha)
         theta = math.radians(45.0)
@@ -342,7 +342,7 @@ class OrientationSensorFusionTests(unittest.TestCase):
 
         self.assertAlmostEqual(self.robot.get_fused_orientation(), 90.0, places=6)
 
-    def test_recalibration_replaces_stale_mag_heading(self) -> None:
+    def test_recalibration_replaces_stale_ahrs_heading(self) -> None:
         # Calibrated (east, 0°) → calibration lost → recalibrated (north, 90°).
         # While uncalibrated the system must fall back to pure odometry, not
         # continue blending against the last valid heading.
@@ -357,7 +357,7 @@ class OrientationSensorFusionTests(unittest.TestCase):
         self.robot._on_kinematics(_make_kin(self.mod, theta=0.0))
         self.assertAlmostEqual(self.robot.get_fused_orientation(), 0.0, places=5)
 
-        # Phase 2: calibration lost.  _mag_heading must be cleared so the
+        # Phase 2: calibration lost.  _ahrs_heading must be cleared so the
         # filter falls back to pure odometry even though odom drifted to 60°.
         self.robot._on_imu(_make_imu(self.mod, mag_calibrated=False, mag_x=0.0, mag_y=1.0))
         self.robot._on_kinematics(_make_kin(self.mod, theta=math.radians(60.0)))
@@ -464,7 +464,7 @@ class OrientationAdaptiveComplementaryFilterTests(unittest.TestCase):
         alpha_fast = f.effective_alpha(linear_vel=0.0, angular_vel=2.0)
         self.assertGreater(alpha_slow, alpha_fast)
 
-    def test_no_mag_returns_odom(self) -> None:
+    def test_no_ahrs_returns_odom(self) -> None:
         f = AdaptiveComplementaryFilter()
         result = f.update(odom_theta=1.0, mag_heading=None,
                           linear_vel=0.0, angular_vel=0.0)
@@ -473,7 +473,7 @@ class OrientationAdaptiveComplementaryFilterTests(unittest.TestCase):
     def test_blend_at_known_velocities(self) -> None:
         f = AdaptiveComplementaryFilter(alpha_min=0.0, alpha_max=0.5,
                                         linear_scale=50.0, angular_scale=0.3)
-        # At rest alpha == 0.5; mag at π/2, odom at 0 → fused = 0 + 0.5*(π/2)
+        # At rest alpha == 0.5; AHRS at π/2, odom at 0 → fused = 0 + 0.5*(π/2)
         expected = 0.0 + 0.5 * (math.pi / 2)
         result = f.update(odom_theta=0.0, mag_heading=math.pi / 2,
                           linear_vel=0.0, angular_vel=0.0)
@@ -482,7 +482,7 @@ class OrientationAdaptiveComplementaryFilterTests(unittest.TestCase):
     def test_wrap_handled_at_pi_boundary(self) -> None:
         f = AdaptiveComplementaryFilter(alpha_min=0.0, alpha_max=1.0,
                                         linear_scale=50.0, angular_scale=0.3)
-        # At rest alpha == 1.0 → result == mag_heading (angles may differ by 2π)
+        # At rest alpha == 1.0 → result == AHRS heading (angles may differ by 2π)
         mag = math.radians(175.0)
         odom = math.radians(-175.0)
         result = f.update(odom_theta=odom, mag_heading=mag,
@@ -539,7 +539,7 @@ class OrientationAdaptiveComplementaryFilterTests(unittest.TestCase):
 class HeadingKalmanFilterTests(unittest.TestCase):
     """Tests for the 1-D Kalman heading filter."""
 
-    def test_no_mag_tracks_odometry_exactly(self) -> None:
+    def test_no_ahrs_tracks_odometry_exactly(self) -> None:
         f = HeadingKalmanFilter()
         for theta in [0.0, 0.3, 0.7, 1.2]:
             result = f.update(odom_theta=theta, mag_heading=None,
@@ -552,15 +552,15 @@ class HeadingKalmanFilterTests(unittest.TestCase):
         f.update(odom_theta=0.0, mag_heading=None, linear_vel=0.0, angular_vel=0.0)
         self.assertGreater(f.variance, P0)
 
-    def test_variance_shrinks_after_mag_update(self) -> None:
+    def test_variance_shrinks_after_ahrs_update(self) -> None:
         f = HeadingKalmanFilter(process_noise=0.001, measurement_noise=0.05,
                                 initial_variance=1.0)
         P_before = f.variance + f.Q   # P_pred on first step
         f.update(odom_theta=0.0, mag_heading=0.0, linear_vel=0.0, angular_vel=0.0)
         self.assertLess(f.variance, P_before)
 
-    def test_applies_nonzero_correction_from_mag(self) -> None:
-        # Odom says 0°, mag says 90°. The Kalman filter must apply some
+    def test_applies_nonzero_correction_from_ahrs(self) -> None:
+        # Odom says 0°, AHRS says 90°. The Kalman filter must apply some
         # correction — the estimate can't stay at exactly 0.
         # Note: the filter will NOT converge to 90° because the process model
         # (odom=0) constantly pulls the prediction back to 0; the steady-state
@@ -573,9 +573,9 @@ class HeadingKalmanFilterTests(unittest.TestCase):
         self.assertGreater(result, 0.0)
         self.assertLess(result, math.pi / 2)
 
-    def test_higher_process_noise_gives_more_mag_weight(self) -> None:
+    def test_higher_process_noise_gives_more_ahrs_weight(self) -> None:
         # With larger Q the filter is less certain about the process model
-        # (odom) so it trusts the magnetometer more.
+        # (odom) so it trusts the AHRS heading more.
         mag = math.pi / 2
         results = []
         for Q in (1e-6, 1e-3, 0.1):
@@ -585,7 +585,7 @@ class HeadingKalmanFilterTests(unittest.TestCase):
                 r = f.update(odom_theta=0.0, mag_heading=mag,
                              linear_vel=0.0, angular_vel=0.0)
             results.append(r)
-        # Larger Q → more mag correction → larger heading estimate
+        # Larger Q → more AHRS correction → larger heading estimate
         self.assertLess(results[0], results[1])
         self.assertLess(results[1], results[2])
 
@@ -600,7 +600,7 @@ class HeadingKalmanFilterTests(unittest.TestCase):
         self.assertLess(correction, math.radians(15.0))
 
     def test_kalman_gain_decreases_as_filter_converges(self) -> None:
-        # Run several mag updates and verify variance (hence K) shrinks.
+        # Run several AHRS updates and verify variance (hence K) shrinks.
         f = HeadingKalmanFilter(process_noise=1e-6, measurement_noise=0.1,
                                 initial_variance=1.0)
         variances = []
@@ -618,8 +618,8 @@ class HeadingKalmanFilterTests(unittest.TestCase):
                           linear_vel=0.0, angular_vel=0.0)
         self.assertAlmostEqual(result, 0.0, places=3)
 
-    def test_low_measurement_noise_trusts_mag_strongly(self) -> None:
-        # With R << P, K ≈ 1 → estimate ≈ mag_heading.
+    def test_low_measurement_noise_trusts_ahrs_strongly(self) -> None:
+        # With R << P, K ≈ 1 → estimate ≈ AHRS heading.
         f = HeadingKalmanFilter(process_noise=1e-4, measurement_noise=1e-6,
                                 initial_variance=1.0)
         result = f.update(odom_theta=0.0, mag_heading=math.pi / 2,
@@ -740,8 +740,8 @@ class FusedPurePursuitTests(unittest.TestCase):
     # 1. When odom theta == fused theta the commands are identical
     # ------------------------------------------------------------------
 
-    def test_no_mag_fused_and_raw_commands_are_identical(self) -> None:
-        # Uncalibrated mag → fusion falls back to odom → commands must match.
+    def test_no_ahrs_fused_and_raw_commands_are_identical(self) -> None:
+        # Uncalibrated AHRS → fusion falls back to odom → commands must match.
         robot = _drive_robot(
             self.mod, self.node,
             imu_mag_x=0.0, imu_mag_y=1.0, mag_calibrated=False,
@@ -757,8 +757,8 @@ class FusedPurePursuitTests(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_fused_heading_changes_steering_command(self) -> None:
-        # Robot A: uncalibrated mag → fused == odom == 0° (east).
-        # Robot B: calibrated mag, alpha=1 → fused == 90° (north).
+        # Robot A: uncalibrated AHRS → fused == odom == 0° (east).
+        # Robot B: calibrated AHRS, alpha=1 → fused == 90° (north).
         # Waypoint is north.  Robot A needs a large left turn; Robot B is aligned.
         robot_no_fusion = _drive_robot(
             self.mod, self.node,
@@ -783,7 +783,7 @@ class FusedPurePursuitTests(unittest.TestCase):
     def test_fused_heading_turns_correct_direction(self) -> None:
         # Uncalibrated robot (fused == odom == 0°, east) facing north waypoint
         # → must turn left (positive ω).
-        # Calibrated robot (fused == 90°, north) already aligned → no turn.
+        # Calibrated AHRS robot (fused == 90°, north) already aligned → no turn.
         robot_no_fusion = _drive_robot(
             self.mod, self.node,
             imu_mag_x=0.0, imu_mag_y=1.0, mag_calibrated=False,
@@ -874,11 +874,11 @@ class FusedPurePursuitTests(unittest.TestCase):
             strategy=AdaptiveComplementaryFilter(**strategy_params),
         )
 
-        # Slow robot gets more mag pull → fused heading is larger (closer to 90°).
+        # Slow robot gets more AHRS pull → fused heading is larger (closer to 90°).
         self.assertGreater(robot_slow.get_fused_orientation(),
                            robot_fast.get_fused_orientation())
 
-    def test_adaptive_filter_at_high_angular_velocity_reduces_mag_weight(self) -> None:
+    def test_adaptive_filter_at_high_angular_velocity_reduces_ahrs_weight(self) -> None:
         # High ω → alpha closer to alpha_min → heading closer to odom (0°).
         strategy_params = dict(alpha_min=0.0, alpha_max=1.0,
                                linear_scale=50.0, angular_scale=0.3)
@@ -896,16 +896,16 @@ class FusedPurePursuitTests(unittest.TestCase):
             strategy=AdaptiveComplementaryFilter(**strategy_params),
         )
 
-        # Still robot gets more mag correction → fused heading closer to 90°.
+        # Still robot gets more AHRS correction → fused heading closer to 90°.
         self.assertGreater(robot_still.get_fused_orientation(),
                            robot_spinning.get_fused_orientation())
 
     # ------------------------------------------------------------------
-    # 5. HeadingKalmanFilter: heading stays between odom and mag
+    # 5. HeadingKalmanFilter: heading stays between odom and AHRS
     # ------------------------------------------------------------------
 
-    def test_kalman_fused_heading_is_between_odom_and_mag(self) -> None:
-        # Odom 0°, mag 90°.  Kalman estimate must be strictly between them.
+    def test_kalman_fused_heading_is_between_odom_and_ahrs(self) -> None:
+        # Odom 0°, AHRS 90°.  Kalman estimate must be strictly between them.
         robot = _drive_robot(
             self.mod, self.node,
             imu_mag_x=0.0, imu_mag_y=1.0, mag_calibrated=True,
@@ -920,9 +920,9 @@ class FusedPurePursuitTests(unittest.TestCase):
         self.assertGreater(fused, 0.0)
         self.assertLess(fused, 90.0)
 
-    def test_kalman_angular_command_is_between_raw_and_full_mag(self) -> None:
+    def test_kalman_angular_command_is_between_raw_and_full_ahrs(self) -> None:
         # Angular command with Kalman heading must sit between the command
-        # produced by pure odom and the command produced by full mag trust.
+        # produced by pure odom and the command produced by full AHRS trust.
         raw_robot = _drive_robot(
             self.mod, self.node,
             imu_mag_x=0.0, imu_mag_y=1.0, mag_calibrated=False,
@@ -930,14 +930,14 @@ class FusedPurePursuitTests(unittest.TestCase):
         )
         _, ang_raw = self._velocity_from_fused(raw_robot)
 
-        full_mag_robot = _drive_robot(
+        full_ahrs_robot = _drive_robot(
             self.mod, FakeNode(),
             imu_mag_x=0.0, imu_mag_y=1.0, mag_calibrated=True,
             odom_theta=0.0,
         )
-        full_mag_robot.set_fusion_alpha(1.0)
-        full_mag_robot._on_kinematics(_make_kin(self.mod, theta=0.0))
-        _, ang_full_mag = self._velocity_from_fused(full_mag_robot)
+        full_ahrs_robot.set_fusion_alpha(1.0)
+        full_ahrs_robot._on_kinematics(_make_kin(self.mod, theta=0.0))
+        _, ang_full_ahrs = self._velocity_from_fused(full_ahrs_robot)
 
         kalman_robot = _drive_robot(
             self.mod, FakeNode(),
@@ -950,8 +950,8 @@ class FusedPurePursuitTests(unittest.TestCase):
         kalman_robot._on_kinematics(_make_kin(self.mod, theta=0.0))
         _, ang_kalman = self._velocity_from_fused(kalman_robot)
 
-        # Kalman correction is partial → command is strictly between raw and full-mag.
-        lo, hi = sorted([ang_full_mag, ang_raw])
+        # Kalman correction is partial → command is strictly between raw and full-AHRS.
+        lo, hi = sorted([ang_full_ahrs, ang_raw])
         self.assertGreater(ang_kalman, lo)
         self.assertLess(ang_kalman, hi)
 
@@ -970,7 +970,7 @@ class FusedPurePursuitTests(unittest.TestCase):
         robot._on_kinematics(_make_kin(self.mod, theta=0.0))
         _, ang_before = self._velocity_from_fused(robot)
 
-        # Switch to full-mag complementary
+        # Switch to full-AHRS complementary
         robot.set_fusion_strategy(ComplementaryFilter(alpha=1.0))
         robot._on_kinematics(_make_kin(self.mod, theta=0.0))
         _, ang_after = self._velocity_from_fused(robot)

@@ -159,7 +159,7 @@ class Robot:
     IMU_Z_DOWN = True or call set_imu_z_down(True).  The Fusion AHRS on the
     Arduino will converge to an inverted-attitude quaternion, causing the
     extracted yaw to be negated; this flag corrects that sign flip in software.
-    The magnetometer must be re-calibrated after physically flipping the sensor.
+    The IMU must be re-calibrated after physically flipping the sensor.
     """
 
     WHEEL_DIAMETER_MM: float = 74.0
@@ -211,13 +211,13 @@ class Robot:
         self._servo_state: ServoStateAll = None
         self._io_output_state: IOOutputState = None
         self._imu:        SensorImu      = None
-        self._imu_z_down:         bool        = self.IMU_Z_DOWN
-        self._mag_heading:        float | None = None   # absolute heading from AHRS (rad)
-        self._mag_heading_offset: float      = 0.0    # mag heading at last reset_odometry()
-        self._mag_accumulated:    float      = 0.0    # incrementally unwrapped relative heading (rad)
-        self._mag_prev_wrapped:   float | None = None  # previous relative_mag for incremental unwrap
-        self._mag_first_sample:   bool       = True   # True until first calibrated sample is processed
-        self._fused_theta:        float      = 0.0    # fusion strategy output (rad)
+        self._imu_z_down:          bool        = self.IMU_Z_DOWN
+        self._ahrs_heading:        float | None = None   # absolute heading from AHRS (rad)
+        self._ahrs_heading_offset: float      = 0.0    # AHRS heading at last reset_odometry()
+        self._ahrs_accumulated:    float      = math.radians(self.INITIAL_THETA_DEG)  # incrementally unwrapped relative heading (rad)
+        self._ahrs_prev_wrapped:   float | None = None  # previous relative_ahrs for incremental unwrap
+        self._ahrs_first_sample:   bool       = True   # True until first calibrated sample is processed
+        self._fused_theta:        float      = math.radians(self.INITIAL_THETA_DEG)  # fusion strategy output (rad)
         self._fusion: SensorFusion           = ComplementaryFilter(alpha=0.02)
         self._pose:    tuple = (0.0, 0.0, 0.0)  # x_mm, y_mm, theta_rad (raw odometry)
         # ── GPS position fusion ───────────────────────────────────────────────
@@ -353,11 +353,10 @@ class Robot:
         with self._lock:
             self._imu = msg
             if msg.mag_calibrated:
-                # Use the Madgwick AHRS quaternion (accel + gyro + mag, 9-axis)
-                # instead of raw 2D atan2(mag_y, mag_x).  The firmware runs the
-                # Fusion library AHRS which integrates all three sensor axes and
-                # applies gyroscope bias correction; the resulting yaw is far
-                # more stable than a bare magnetometer heading.
+                # Use the Madgwick AHRS quaternion (accel + gyro + mag, 9-axis).
+                # The firmware runs the Fusion library AHRS which integrates all
+                # three sensor axes and applies gyroscope bias correction; the
+                # resulting yaw is a tilt-compensated, drift-corrected heading.
                 # Convention: NWU (North-West-Up), yaw via ZYX Euler extraction.
                 qw = float(msg.quat_w)
                 qx = float(msg.quat_x)
@@ -370,12 +369,12 @@ class Robot:
                 # When the sensor is mounted upside-down (Z toward ground) the
                 # AHRS converges to an inverted-attitude quaternion, making the
                 # extracted yaw the negative of the physical heading.
-                self._mag_heading = -yaw if self._imu_z_down else yaw
+                self._ahrs_heading = -yaw if self._imu_z_down else yaw
             else:
                 # Calibration lost or not yet acquired — clear the heading so
                 # _on_kinematics falls back to pure odometry rather than
                 # continuing to fuse against a stale absolute reference.
-                self._mag_heading = None
+                self._ahrs_heading = None
 
     def _on_kinematics(self, msg: SensorKinematics) -> None:
         with self._lock:
@@ -388,41 +387,41 @@ class Robot:
             # The firmware odometry (msg.theta) is unbounded — it accumulates past
             # 2π for multiple rotations.  Passing the bounded AHRS directly to the
             # filter causes wrap() discontinuities every half-revolution when
-            # |mag - odom| crosses ±π.
+            # |ahrs - odom| crosses ±π.
             #
-            # Fix: incrementally unwrap the relative mag heading so it accumulates
+            # Fix: incrementally unwrap the relative AHRS heading so it accumulates
             # in the same unbounded frame as odometry.  Their difference then stays
             # small, and wrap() in the filter is never discontinuous.
-            if self._mag_heading is not None:
+            if self._ahrs_heading is not None:
                 curr_wrapped = math.atan2(
-                    math.sin(self._mag_heading - self._mag_heading_offset),
-                    math.cos(self._mag_heading - self._mag_heading_offset),
+                    math.sin(self._ahrs_heading - self._ahrs_heading_offset),
+                    math.cos(self._ahrs_heading - self._ahrs_heading_offset),
                 )
-                if self._mag_prev_wrapped is not None:
+                if self._ahrs_prev_wrapped is not None:
                     delta = math.atan2(
-                        math.sin(curr_wrapped - self._mag_prev_wrapped),
-                        math.cos(curr_wrapped - self._mag_prev_wrapped),
+                        math.sin(curr_wrapped - self._ahrs_prev_wrapped),
+                        math.cos(curr_wrapped - self._ahrs_prev_wrapped),
                     )
-                    self._mag_accumulated += delta
-                elif self._mag_first_sample:
+                    self._ahrs_accumulated += delta
+                elif self._ahrs_first_sample:
                     # Very first calibrated sample since startup: seed the
-                    # accumulator from the actual compass reading so that
-                    # relative_mag equals the true heading, not 0.
+                    # accumulator from the actual AHRS reading so that
+                    # relative_ahrs equals the true heading, not 0.
                     # (Post-reset the accumulator is pre-seeded by
-                    # reset_odometry() and _mag_first_sample is False.)
-                    self._mag_accumulated = curr_wrapped
-                    self._mag_first_sample = False
+                    # reset_odometry() and _ahrs_first_sample is False.)
+                    self._ahrs_accumulated = curr_wrapped
+                    self._ahrs_first_sample = False
                 # else: first sample after reset_odometry() — accumulator
                 # already holds initial_theta, leave it unchanged.
-                self._mag_prev_wrapped = curr_wrapped
-                relative_mag = self._mag_accumulated
+                self._ahrs_prev_wrapped = curr_wrapped
+                relative_ahrs = self._ahrs_accumulated
             else:
-                relative_mag = None
+                relative_ahrs = None
             linear_vel  = math.hypot(float(msg.vx), float(msg.vy))
             angular_vel = float(msg.v_theta)
             self._fused_theta = self._fusion.update(
                 odom_theta  = msg.theta,
-                mag_heading = relative_mag,
+                mag_heading = relative_ahrs,
                 linear_vel  = linear_vel,
                 angular_vel = angular_vel,
             )
@@ -587,19 +586,19 @@ class Robot:
     def reset_odometry(self) -> None:
         """Reset firmware odometry pose to (0, 0, initial_theta).
 
-        Captures the current magnetometer heading as the new zero reference and
-        initialises the relative-mag accumulator to match the firmware's
+        Captures the current AHRS heading as the new zero reference and
+        initialises the relative-AHRS accumulator to match the firmware's
         initial_theta so that the fusion filter sees no spurious discrepancy
-        between odometry and magnetometer immediately after reset.
+        between odometry and AHRS heading immediately after reset.
 
         After this call, get_fused_orientation() and get_pose()[2] will both
         report initial_theta (default 90°), not 0°.
         """
         with self._lock:
-            self._mag_heading_offset = self._mag_heading if self._mag_heading is not None else 0.0
-            self._mag_accumulated  = math.radians(self._initial_theta_deg)
-            self._mag_prev_wrapped = None
-            self._mag_first_sample = False  # post-reset seeding handled above
+            self._ahrs_heading_offset = self._ahrs_heading if self._ahrs_heading is not None else 0.0
+            self._ahrs_accumulated  = math.radians(self._initial_theta_deg)
+            self._ahrs_prev_wrapped = None
+            self._ahrs_first_sample = False  # post-reset seeding handled above
         msg = SysOdomReset()
         msg.flags = 0
         self._odom_pub.publish(msg)
@@ -1558,9 +1557,9 @@ class Robot:
         """
         Return complementary-filter orientation estimate in degrees.
 
-        Blends the absolute magnetometer heading (corrects long-term drift) with
+        Blends the absolute AHRS heading (corrects long-term drift) with
         the odometry theta (smooth, short-term accurate). The filter weight
-        ``_fusion_alpha`` (default 0.02) controls how quickly the magnetometer
+        ``_fusion_alpha`` (default 0.02) controls how quickly the AHRS
         heading pulls the estimate; it only activates once the firmware reports
         ``mag_calibrated = True``. Before calibration, returns odometry theta.
         """
@@ -1580,14 +1579,14 @@ class Robot:
 
     def set_fusion_alpha(self, alpha: float) -> None:
         """
-        Set the magnetometer weight for the complementary filter (0.0–1.0).
+        Set the AHRS heading weight for the complementary filter (0.0–1.0).
 
         Only valid when the active strategy is ComplementaryFilter (the default).
         Raises TypeError if a different strategy is currently active — call
         set_fusion_strategy(ComplementaryFilter(alpha)) instead.
 
-        Lower values trust odometry more (less mag noise, more drift).
-        Higher values correct drift faster but introduce magnetometer noise.
+        Lower values trust odometry more (less AHRS noise, more drift).
+        Higher values correct drift faster but introduce more AHRS noise.
         Default is 0.02.
         """
         with self._lock:
@@ -1609,7 +1608,7 @@ class Robot:
         quaternion is negated to undo the sign flip caused by the inverted
         attitude the Fusion library converges to.
 
-        The magnetometer must be re-calibrated after physically flipping the
+        The IMU must be re-calibrated after physically flipping the
         sensor; calibration data collected in one orientation is not valid in
         the other.
 
@@ -1623,7 +1622,7 @@ class Robot:
         Return the fused (x, y, theta_deg) in user units and degrees.
 
         Position is a complementary-filter blend of GPS (ArUco tag) and odometry.
-        Orientation is a complementary-filter blend of magnetometer and odometry.
+        Orientation is a complementary-filter blend of AHRS heading and odometry.
         When the GPS tag is not visible for more than ``_gps_timeout_s`` seconds,
         the position falls back to pure odometry automatically.
         """
