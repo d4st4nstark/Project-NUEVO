@@ -211,6 +211,15 @@ def _drive_straight(robot: Robot, rec: _Record) -> None:
     gps_acq_odom_y = odom_y0
     warned_no_gps = False
     max_dist = DRIVE_DISTANCE_MM + GPS_SEARCH_EXTRA_MM
+    # X plot references — reset on the first recording tick after GPS aligns so
+    # the X panel shows drift *since GPS activation*, not the GPS-frame
+    # translation offset.  Y is already relative (robot drives in +Y from
+    # the start, so odom_y0 / fused_y0 captured at start are the correct
+    # references).  X stays near 0 throughout, so the GPS X-frame offset
+    # would otherwise dominate the lateral-drift panel.
+    plot_odom_x0  = odom_x0
+    plot_fused_x0 = fused_x0
+    gps_x_ref_set = False
 
     print(
         f"[pos_fusion_test] Driving in world-Y direction for {DRIVE_DISTANCE_MM:.0f} mm "
@@ -256,12 +265,27 @@ def _drive_straight(robot: Robot, rec: _Record) -> None:
 
         fused_x_mm, fused_y_mm, _ = robot._get_pose_mm()
 
+        # On the first recording tick after GPS aligns, re-zero the X references
+        # so the lateral-drift panel shows drift relative to the GPS-activation
+        # point, not the GPS-frame X translation.
+        if gps_aligned and not gps_x_ref_set:
+            plot_odom_x0  = odom_x
+            plot_fused_x0 = fused_x_mm
+            gps_x_ref_set = True
+            print(
+                f"[pos_fusion_test] GPS X reference set: "
+                f"odom_x={odom_x:.1f} mm, fused_x={fused_x_mm:.1f} mm "
+                f"(GPS X offset absorbed = {fused_x_mm - odom_x:.1f} mm)"
+            )
+
         elapsed = time.monotonic() - t_start
-        # Record relative to starting position so plots start at (0, 0).
+        # Record X relative to the GPS-activation reference (removes GPS-frame
+        # X translation); record Y relative to the test-start position (captures
+        # the full forward progress from rest).
         rec.append(
             elapsed,
-            odom_x - odom_x0, odom_y - odom_y0,
-            fused_x_mm - fused_x0, fused_y_mm - fused_y0,
+            odom_x - plot_odom_x0, odom_y - odom_y0,
+            fused_x_mm - plot_fused_x0, fused_y_mm - fused_y0,
             gps_on,
         )
 
